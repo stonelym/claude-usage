@@ -143,5 +143,127 @@ class SingleInstance(unittest.TestCase):
         self.assertIsNone(second)
 
 
+# ---------------------------------------------------------------------------
+# Self-update: pure helpers
+# ---------------------------------------------------------------------------
+class ParseVersion(unittest.TestCase):
+    def test_strips_leading_v(self):
+        self.assertEqual(cu.parse_version("v1.2.0"), (1, 2, 0))
+
+    def test_plain_dotted(self):
+        self.assertEqual(cu.parse_version("1.2"), (1, 2))
+
+    def test_ignores_prerelease_suffix(self):
+        self.assertEqual(cu.parse_version("v1.2.3-beta"), (1, 2, 3))
+
+    def test_garbage_is_empty(self):
+        self.assertEqual(cu.parse_version("garbage"), ())
+
+
+class IsNewerVersion(unittest.TestCase):
+    def test_higher_patch_is_newer(self):
+        self.assertTrue(cu.is_newer_version("1.0.1", "1.0.0"))
+
+    def test_equal_is_not_newer(self):
+        self.assertFalse(cu.is_newer_version("1.0.0", "1.0.0"))
+
+    def test_short_equals_zero_padded(self):
+        # 1.2 and 1.2.0 are the same version
+        self.assertFalse(cu.is_newer_version("1.2", "1.2.0"))
+
+    def test_older_is_not_newer(self):
+        self.assertFalse(cu.is_newer_version("1.0.0", "1.1.0"))
+
+    def test_v_prefixed_remote(self):
+        self.assertTrue(cu.is_newer_version("v2.0.0", "1.9.9"))
+
+
+class SelectReleaseAssets(unittest.TestCase):
+    def _release(self, names):
+        return {"tag_name": "v1.2.0",
+                "assets": [{"name": n,
+                            "browser_download_url": f"https://x/{n}"} for n in names]}
+
+    def test_returns_info_when_both_assets_present(self):
+        rel = self._release(["ClaudeUsage.exe", "ClaudeUsage.exe.sha256", "extra.txt"])
+        info = cu.select_release_assets(rel, "ClaudeUsage.exe", "ClaudeUsage.exe.sha256")
+        self.assertIsNotNone(info)
+        self.assertEqual(info.tag, "v1.2.0")
+        self.assertEqual(info.exe_url, "https://x/ClaudeUsage.exe")
+        self.assertEqual(info.sha_url, "https://x/ClaudeUsage.exe.sha256")
+
+    def test_none_when_exe_missing(self):
+        rel = self._release(["ClaudeUsage.exe.sha256"])
+        self.assertIsNone(
+            cu.select_release_assets(rel, "ClaudeUsage.exe", "ClaudeUsage.exe.sha256"))
+
+    def test_none_when_sha_missing(self):
+        rel = self._release(["ClaudeUsage.exe"])
+        self.assertIsNone(
+            cu.select_release_assets(rel, "ClaudeUsage.exe", "ClaudeUsage.exe.sha256"))
+
+    def test_none_on_empty_payload(self):
+        self.assertIsNone(
+            cu.select_release_assets({}, "ClaudeUsage.exe", "ClaudeUsage.exe.sha256"))
+
+
+class ParseSha256Sidecar(unittest.TestCase):
+    HEX = "a" * 64
+
+    def test_bare_hex(self):
+        self.assertEqual(cu.parse_sha256_sidecar(self.HEX), self.HEX)
+
+    def test_sha256sum_format(self):
+        self.assertEqual(
+            cu.parse_sha256_sidecar(f"{self.HEX}  ClaudeUsage.exe"), self.HEX)
+
+    def test_uppercase_is_lowercased(self):
+        self.assertEqual(cu.parse_sha256_sidecar("A" * 64), self.HEX)
+
+    def test_garbage_is_none(self):
+        self.assertIsNone(cu.parse_sha256_sidecar("not a hash"))
+
+    def test_wrong_length_is_none(self):
+        self.assertIsNone(cu.parse_sha256_sidecar("abc123"))
+
+
+class VerifySha256(unittest.TestCase):
+    def _tmp(self, data: bytes):
+        import tempfile, os
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        self.addCleanup(lambda: os.remove(path))
+        return path
+
+    def test_matching_hash(self):
+        import hashlib
+        data = b"hello world"
+        path = self._tmp(data)
+        self.assertTrue(cu.verify_sha256(path, hashlib.sha256(data).hexdigest()))
+
+    def test_mismatched_hash(self):
+        path = self._tmp(b"hello world")
+        self.assertFalse(cu.verify_sha256(path, "0" * 64))
+
+    def test_case_insensitive(self):
+        import hashlib
+        data = b"abc"
+        path = self._tmp(data)
+        self.assertTrue(
+            cu.verify_sha256(path, hashlib.sha256(data).hexdigest().upper()))
+
+
+class ShouldCheckForUpdate(unittest.TestCase):
+    def test_true_when_interval_elapsed(self):
+        self.assertTrue(cu.should_check_for_update(now=1000, last_check=0, interval_s=600))
+
+    def test_false_when_recent(self):
+        self.assertFalse(cu.should_check_for_update(now=1000, last_check=900, interval_s=600))
+
+    def test_true_when_never_checked(self):
+        self.assertTrue(cu.should_check_for_update(now=1000, last_check=None, interval_s=600))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,8 +33,10 @@ mode has no such risk.
 """
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -49,6 +51,7 @@ import requests
 # /api/oauth/usage is an on-demand endpoint (Claude Code only hits it when you
 # run /usage). The 5h/7d windows move slowly, so polling every 5 min is plenty
 # and — crucially — avoids tripping the endpoint's rate limit. See fetch_usage.
+VERSION = "1.0.0"  # single source of truth; build.ps1 reads this to tag releases
 POLL_SECONDS = 300
 APP_NAME = "ClaudeUsage"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -59,7 +62,16 @@ TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code public client
 CRED_PATH = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
 USAGE_PAGE = "https://claude.ai/settings/usage"
-USER_AGENT = "claude-code/2.0.31"
+USER_AGENT = "claude-code/2.0.31"  # the usage endpoint expects the Claude Code UA
+
+# Self-update via GitHub Releases (public repo). The app reads releases/latest,
+# compares VERSION, and offers a verified swap. See fetch_latest_release.
+GITHUB_REPO = "stonelym/claude-usage"
+RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_UA = f"ClaudeUsage/{VERSION}"   # GitHub requires a User-Agent
+UPDATE_INTERVAL = 86400                # check at most once a day
+ASSET_EXE = "ClaudeUsage.exe"
+ASSET_SHA = "ClaudeUsage.exe.sha256"
 
 KNOWN_WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet")
 NOTIFY_THRESHOLDS = (80.0, 95.0)
@@ -285,6 +297,97 @@ def compute_next_wait(result: FetchResult, base_poll: int) -> int:
 
 
 # ----------------------------------------------------------------------------
+# Self-update (pure helpers — unit-testable without network)
+# ----------------------------------------------------------------------------
+class UpdateInfo:
+    """A newer release to offer. Value object, mirrors FetchResult."""
+    __slots__ = ("tag", "exe_url", "sha_url")
+
+    def __init__(self, tag, exe_url, sha_url):
+        self.tag = tag
+        self.exe_url = exe_url
+        self.sha_url = sha_url
+
+
+def parse_version(tag: str) -> tuple:
+    """'v1.2.3-beta' -> (1, 2, 3). Leading 'v' optional; parsing stops at the
+    first dotted component without a leading integer (so pre-release suffixes
+    and junk are ignored). Unparseable -> ()."""
+    if not tag:
+        return ()
+    s = tag.strip()
+    if s[:1] in ("v", "V"):
+        s = s[1:]
+    out = []
+    for part in s.split("."):
+        m = re.match(r"\d+", part)
+        if not m:
+            break
+        out.append(int(m.group()))
+    return tuple(out)
+
+
+def is_newer_version(remote: str, local: str) -> bool:
+    """True if `remote` is a strictly higher version than `local`. Shorter
+    versions are zero-padded, so 1.2 == 1.2.0."""
+    r, l = parse_version(remote), parse_version(local)
+    n = max(len(r), len(l))
+    r += (0,) * (n - len(r))
+    l += (0,) * (n - len(l))
+    return r > l
+
+
+def select_release_assets(release_json, exe_name: str, sha_name: str):
+    """Map a GitHub releases/latest payload to an UpdateInfo, or None if the
+    tag or either required asset is missing. Pure (no network)."""
+    if not isinstance(release_json, dict):
+        return None
+    tag = release_json.get("tag_name")
+    if not tag:
+        return None
+    urls = {}
+    for asset in release_json.get("assets") or []:
+        name = asset.get("name")
+        if name in (exe_name, sha_name):
+            urls[name] = asset.get("browser_download_url")
+    if exe_name not in urls or sha_name not in urls:
+        return None
+    if not urls[exe_name] or not urls[sha_name]:
+        return None
+    return UpdateInfo(tag, urls[exe_name], urls[sha_name])
+
+
+def parse_sha256_sidecar(text: str):
+    """Pull the 64-hex SHA-256 out of a sidecar file. Accepts a bare hash or
+    sha256sum format ('<hash>  filename'). Returns it lowercased, or None."""
+    if not text:
+        return None
+    m = re.search(r"\b([0-9a-fA-F]{64})\b", text)
+    return m.group(1).lower() if m else None
+
+
+def verify_sha256(path: str, expected_hex: str, chunk: int = 1 << 20) -> bool:
+    """Stream-hash a file and compare to expected_hex (case-insensitive)."""
+    if not expected_hex:
+        return False
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(chunk), b""):
+                h.update(block)
+    except OSError:
+        return False
+    return h.hexdigest() == expected_hex.lower()
+
+
+def should_check_for_update(now: float, last_check, interval_s: int) -> bool:
+    """True if at least interval_s has elapsed since last_check (or never)."""
+    if last_check is None:
+        return True
+    return (now - last_check) >= interval_s
+
+
+# ----------------------------------------------------------------------------
 # Config + startup registration
 # ----------------------------------------------------------------------------
 def load_config() -> dict:
@@ -325,9 +428,31 @@ def acquire_single_instance(name: str = APP_NAME):
     k32.CreateMutexW.restype = wintypes.HANDLE
     handle = k32.CreateMutexW(None, False, f"{name}_singleton")
     ERROR_ALREADY_EXISTS = 183
-    if not handle or k32.GetLastError() == ERROR_ALREADY_EXISTS:
+    if not handle:
+        return None
+    if k32.GetLastError() == ERROR_ALREADY_EXISTS:
+        # CreateMutexW still hands back a valid handle to the existing object;
+        # close it so a retry loop doesn't accumulate handles.
+        k32.CloseHandle(handle)
         return None
     return handle
+
+
+def acquire_single_instance_blocking(name: str = APP_NAME, timeout_s: float = 10.0):
+    """Like acquire_single_instance, but waits up to timeout_s for an existing
+    holder to exit before giving up. Used only by an update relaunch, where the
+    outgoing process releases the mutex within ~1s. Normal launches use the
+    one-shot variant so a genuine duplicate still exits immediately."""
+    if sys.platform != "win32":
+        return True
+    deadline = time.time() + timeout_s
+    while True:
+        handle = acquire_single_instance(name)
+        if handle is not None:
+            return handle
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.25)
 
 
 def startup_command() -> str:
@@ -470,6 +595,53 @@ def fetch_usage() -> FetchResult:
             continue
         return res
     return FetchResult("error")
+
+
+# ----------------------------------------------------------------------------
+# Self-update (network — thin wrappers around the pure helpers)
+# ----------------------------------------------------------------------------
+def fetch_latest_release():
+    """Query GitHub for the latest release; return an UpdateInfo or None.
+
+    Public repo, so no auth. Never raises — update checks must not crash the
+    app or interfere with usage polling.
+    """
+    try:
+        r = requests.get(
+            RELEASE_URL,
+            headers={"User-Agent": GITHUB_UA,
+                     "Accept": "application/vnd.github+json"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        return select_release_assets(r.json(), ASSET_EXE, ASSET_SHA)
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def download_to(url: str, dest_path: str) -> bool:
+    """Stream a URL to dest_path atomically (temp + os.replace). True on
+    success. Never raises."""
+    tmp = dest_path + ".part"
+    try:
+        with requests.get(url, headers={"User-Agent": GITHUB_UA},
+                          stream=True, timeout=60) as r:
+            if r.status_code != 200:
+                return False
+            with open(tmp, "wb") as f:
+                for block in r.iter_content(chunk_size=1 << 20):
+                    if block:
+                        f.write(block)
+        os.replace(tmp, dest_path)
+        return True
+    except (requests.RequestException, OSError):
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
 
 
 # ----------------------------------------------------------------------------
@@ -817,6 +989,8 @@ class UsageTray:
         self.icon = None
         self.rate_limited_until = None   # epoch seconds; None when not limited
         self.last_result = FetchResult("error")
+        self._pending = None             # UpdateInfo when a newer release exists
+        self.last_update_check = self.config.get("last_update_check")
 
     # -- polling --------------------------------------------------------------
     def poll_once(self):
@@ -853,6 +1027,128 @@ class UsageTray:
                 self.update_icon()
                 wait = POLL_SECONDS
             self.stop.wait(wait)
+
+    # -- self-update ------------------------------------------------------------
+    def update_loop(self):
+        """Check for a newer release shortly after launch, then ~daily.
+        Only started for frozen builds (script mode can't self-replace)."""
+        if self.stop.wait(8):            # let startup settle
+            return
+        while not self.stop.is_set():
+            if should_check_for_update(time.time(), self.last_update_check,
+                                       UPDATE_INTERVAL):
+                try:
+                    self.check_for_update()
+                except Exception:
+                    pass
+            if self.stop.wait(3600):     # wake hourly; the gate throttles to daily
+                return
+
+    def check_for_update(self):
+        """Fetch latest release; if newer, arm the tray item + toast once."""
+        self.last_update_check = time.time()
+        self.config["last_update_check"] = self.last_update_check
+        save_config(self.config)
+        info = fetch_latest_release()
+        if info and is_newer_version(info.tag, VERSION):
+            already = self._pending is not None and self._pending.tag == info.tag
+            self._pending = info
+            if self.icon:
+                if not already:
+                    self.icon.notify(
+                        f"ClaudeUsage {info.tag} is available — open the menu "
+                        f"to update.", "Update available")
+                self.icon.update_menu()
+
+    def start_update(self):
+        threading.Thread(target=self.apply_update, daemon=True).start()
+
+    def apply_update(self):
+        """Download, verify (SHA-256), swap the running exe, and relaunch.
+
+        Critical-section ordering with rollback so a failure never leaves the
+        install without a working ClaudeUsage.exe. INSTALL_DIR is captured up
+        front — sys.executable is unreliable once the exe is renamed.
+        """
+        info = self._pending
+        if not info or not getattr(sys, "frozen", False):
+            return
+        install_dir = os.path.dirname(os.path.abspath(sys.executable))
+        canonical = os.path.join(install_dir, ASSET_EXE)
+        old = os.path.join(install_dir, "ClaudeUsage.old.exe")
+        new = os.path.join(install_dir, "ClaudeUsage.new.exe")
+
+        # 1. Download + verify BEFORE touching the installed exe.
+        if not download_to(info.exe_url, new):
+            return self._update_failed("download failed", new)
+        expected = self._fetch_sidecar_hash(info.sha_url)
+        if not expected or not verify_sha256(new, expected):
+            return self._update_failed("verification failed", new)
+
+        # 2. Critical section: rename current out of the way, move new in.
+        try:
+            if os.path.exists(old):
+                os.remove(old)
+        except OSError:
+            return self._update_failed("could not clear old backup", new)
+        if not self._move_retry(canonical, old, replace=False):
+            return self._update_failed("could not stage current exe", new)
+        if not self._move_retry(new, canonical, replace=True):
+            self._move_retry(old, canonical, replace=False)   # rollback
+            return self._update_failed("could not install new exe", None)
+
+        # 3. Relaunch the new exe, then quit to release the mutex.
+        self._relaunch(canonical, install_dir)
+        self.quit()
+
+    def _fetch_sidecar_hash(self, url):
+        try:
+            r = requests.get(url, headers={"User-Agent": GITHUB_UA}, timeout=15)
+            if r.status_code != 200:
+                return None
+            return parse_sha256_sidecar(r.text)
+        except requests.RequestException:
+            return None
+
+    def _move_retry(self, src, dst, replace, tries=3, delay=0.2):
+        """os.replace/os.rename with bounded retry for transient AV file locks."""
+        for i in range(tries):
+            try:
+                os.replace(src, dst) if replace else os.rename(src, dst)
+                return True
+            except OSError:
+                if i == tries - 1:
+                    return False
+                time.sleep(delay)
+        return False
+
+    def _relaunch(self, exe, cwd):
+        import subprocess
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_NO_WINDOW = 0x08000000
+        try:
+            subprocess.Popen(
+                [exe, "--updated"],
+                creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                               | CREATE_NO_WINDOW),
+                close_fds=True, cwd=cwd,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            # Swap already succeeded; the new exe runs at next login regardless.
+            pass
+
+    def _update_failed(self, reason, cleanup_path):
+        if cleanup_path:
+            try:
+                os.remove(cleanup_path)
+            except OSError:
+                pass
+        if self.icon:
+            self.icon.notify(f"Update failed: {reason}. Still on v{VERSION}.",
+                             "ClaudeUsage")
 
     # -- notifications ----------------------------------------------------------
     def check_thresholds(self):
@@ -899,11 +1195,25 @@ class UsageTray:
         import pystray
         from pystray import Menu, MenuItem as Item
 
-        items = [
+        frozen = getattr(sys, "frozen", False)
+        items = [Item(f"ClaudeUsage v{VERSION}", lambda: None, enabled=False)]
+        if frozen:
+            # Visible only once a newer release is staged; text/visibility are
+            # callables so update_menu() reflects state without rebuilding.
+            items.append(Item(
+                lambda item: (f"Update to {self._pending.tag} & restart"
+                              if self._pending else "Update & restart"),
+                lambda: self.start_update(),
+                visible=lambda item: self._pending is not None))
+        items += [
+            Menu.SEPARATOR,
             Item("Refresh now", lambda: threading.Thread(
                 target=self.poll_once, daemon=True).start()),
             Item("Open usage page", lambda: webbrowser.open(USAGE_PAGE)),
         ]
+        if frozen:
+            items.append(Item("Check for updates now", lambda: threading.Thread(
+                target=self.check_for_update, daemon=True).start()))
         if sys.platform == "win32":
             items += [
                 Menu.SEPARATOR,
@@ -925,6 +1235,8 @@ class UsageTray:
     def run(self, taskbar=False, debug=False):
         self.build_icon()
         threading.Thread(target=self.poll_loop, daemon=True).start()
+        if getattr(sys, "frozen", False):
+            threading.Thread(target=self.update_loop, daemon=True).start()
 
         badge = None
         if taskbar:
@@ -952,13 +1264,34 @@ class UsageTray:
             self.icon.stop()
 
 
+def cleanup_update_leftovers():
+    """Best-effort removal of files left by a self-update: the previous exe
+    (.old, unlocked once that process exited) and any half-downloaded .new."""
+    if not getattr(sys, "frozen", False):
+        return
+    install_dir = os.path.dirname(os.path.abspath(sys.executable))
+    for name in ("ClaudeUsage.old.exe", "ClaudeUsage.new.exe",
+                 "ClaudeUsage.new.exe.part"):
+        try:
+            p = os.path.join(install_dir, name)
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser(description="Claude usage taskbar widget")
     ap.add_argument("--taskbar", action="store_true",
                     help="force taskbar text mode on (and persist it to config)")
     ap.add_argument("--debug", action="store_true",
                     help="print taskbar-embed diagnostics (run with python, not pythonw)")
+    ap.add_argument("--updated", action="store_true",
+                    help="set by a self-update relaunch; waits briefly for the "
+                         "outgoing instance to release the single-instance lock")
     args = ap.parse_args()
+
+    cleanup_update_leftovers()
 
     if not os.path.exists(CRED_PATH):
         _warn(f"Credentials not found at {CRED_PATH}.\n"
@@ -967,8 +1300,11 @@ def main():
 
     # Only one instance may poll; a second would double the request rate into
     # the rate-limited usage endpoint. Hold the handle for the process life.
+    # An update relaunch waits out the outgoing instance's lock; a normal
+    # duplicate launch exits immediately.
     global _instance_handle
-    _instance_handle = acquire_single_instance()
+    _instance_handle = (acquire_single_instance_blocking() if args.updated
+                        else acquire_single_instance())
     if _instance_handle is None:
         _warn("ClaudeUsage is already running.\n")
         sys.exit(0)
