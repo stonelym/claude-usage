@@ -1,0 +1,63 @@
+name: release
+
+# Push a version tag (e.g. v1.2.3) to build the exe + installer and publish the
+# GitHub release. Use release.ps1 (reads VERSION, tags, pushes) to cut one.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write          # gh release create
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pyinstaller pystray pillow requests comtypes
+
+      - name: Unit tests (gate)
+        run: python -m unittest -v test_claude_usage
+
+      - name: Assert tag matches VERSION
+        shell: pwsh
+        run: |
+          $ver = (Select-String claude_usage_tray.py -Pattern '^VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ("v$ver" -ne "${{ github.ref_name }}") {
+            throw "tag ${{ github.ref_name }} != VERSION v$ver — bump VERSION to match the tag"
+          }
+          "VER=$ver" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Build exe (PyInstaller)
+        run: >
+          python -m PyInstaller --onefile --noconsole --name ClaudeUsage
+          --hidden-import pystray._win32 --hidden-import comtypes
+          --distpath dist --workpath build --specpath . claude_usage_tray.py
+
+      - name: SHA-256 sidecar
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist/ClaudeUsage.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content dist/ClaudeUsage.exe.sha256 $h -NoNewline -Encoding ascii
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer (setup.exe)
+        run: >
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          /DAppVersion=${{ env.VER }} installer\ClaudeUsage.iss
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create ${{ github.ref_name }}
+          dist/ClaudeUsage.exe dist/ClaudeUsage.exe.sha256 dist/ClaudeUsageSetup.exe
+          --title ${{ github.ref_name }} --notes "ClaudeUsage ${{ github.ref_name }}"
