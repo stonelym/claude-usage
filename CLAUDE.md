@@ -8,8 +8,8 @@ A Windows taskbar/tray widget that displays Claude plan-usage (`session` and `we
 utilization %) by polling the same unofficial endpoint Claude Code's `/usage` command
 uses. Single-file Python app: `claude_usage_tray.py`, with stdlib `unittest` tests in
 `test_claude_usage.py`. Distributed as a PyInstaller `--onefile` exe and self-updates from
-GitHub Releases (repo: `stonelym/claude-usage`). No dependency manifest (`build.ps1`
-installs deps).
+GitHub Releases (repo: `stonelym/claude-usage`). The exe and `ClaudeUsageSetup.exe` installer
+are built by **GitHub Actions** (`.github/workflows/release.yml`), not locally.
 
 ## Commands
 
@@ -23,22 +23,27 @@ python claude_usage_tray.py --debug
 # Force taskbar text mode on and persist it to config
 python claude_usage_tray.py --taskbar
 
-# Install deps manually
-pip install pystray pillow requests comtypes   # tkinter ships with Python
-
-# Build a standalone exe and install to %LOCALAPPDATA%\Programs\ClaudeUsage, then launch
-powershell -ExecutionPolicy Bypass -File .\build.ps1
-
-# Build + install AND publish a GitHub release (tag from VERSION) for self-update
-powershell -ExecutionPolicy Bypass -File .\build.ps1 -Publish
+# Install deps manually for local dev (tkinter ships with Python)
+pip install pystray pillow requests comtypes
 
 # Run the unit tests (stdlib unittest, no display/network needed)
 python -m unittest -v test_claude_usage
+
+# Cut a release: bump VERSION, commit, then tag + push (CI builds & publishes)
+powershell -ExecutionPolicy Bypass -File .\release.ps1
 ```
 
-**Shipping an update:** bump `VERSION` in `claude_usage_tray.py`, then
-`build.ps1 -Publish`. Installed copies poll GitHub Releases (~daily), notify, and self-swap
-on user confirm. `-Publish` refuses to clobber an existing tag, so VERSION must be bumped.
+**Shipping an update:** bump `VERSION` in `claude_usage_tray.py`, commit, then run
+`release.ps1` (tags `vX.Y.Z` and pushes). GitHub Actions builds the exe + installer, asserts
+the tag matches `VERSION`, and publishes the release with three assets: `ClaudeUsage.exe`
+(self-update target), `ClaudeUsage.exe.sha256`, and `ClaudeUsageSetup.exe` (fresh installs).
+Installed copies poll `releases/latest` (~daily), notify, and self-swap on user confirm.
+
+**Installing on a new machine:** download `ClaudeUsageSetup.exe` from the latest release. The
+Inno Setup installer (`installer/ClaudeUsage.iss`) is **per-user** — installs to
+`%LOCALAPPDATA%\Programs\ClaudeUsage` with no admin prompt, which is the same directory the
+app self-updates in, so updates stay unprivileged. It optionally adds the HKCU `Run` startup
+entry (the same value the tray toggle uses) and a Start Menu shortcut.
 
 Tests live in `test_claude_usage.py` (stdlib `unittest`, no extra deps). They cover the
 display-free logic: usage parsing, 429/Retry-After classification, poll-backoff math, the
@@ -98,8 +103,9 @@ tick but doesn't own it.
 
 ### Self-update (GitHub Releases)
 
-- `VERSION` is the single source of truth; `build.ps1` parses it to tag releases and embeds
-  it in the GitHub User-Agent. `USER_AGENT` (the `claude-code/...` string) is separate and
+- `VERSION` is the single source of truth; `release.ps1` and the CI workflow parse it to tag
+  releases (and CI asserts the tag matches it), and it's embedded in the GitHub User-Agent.
+  `USER_AGENT` (the `claude-code/...` string) is separate and
   must stay as-is — the usage endpoint depends on it; GitHub uses `GITHUB_UA`.
 - Flow: `update_loop` → `fetch_latest_release()` (reads `releases/latest`, public repo, no
   auth) → `select_release_assets` → `is_newer_version` → arm `self._pending`, toast, and a
