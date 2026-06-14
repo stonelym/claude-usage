@@ -47,9 +47,11 @@ entry (the same value the tray toggle uses) and a Start Menu shortcut.
 
 Tests live in `test_claude_usage.py` (stdlib `unittest`, no extra deps). They cover the
 display-free logic: usage parsing, 429/Retry-After classification, poll-backoff math, the
-single-instance guard, and badge-position math. The pure functions are deliberately
-importable without a display — but the module does a top-level `import requests`, so
-`requests` must be installed to import it at all.
+single-instance guard, badge-position math (`compute_badge_x`/`should_move`/`is_fullscreen`),
+and the self-update helpers (`parse_version`/`is_newer_version`/`select_release_assets`/
+`parse_sha256_sidecar`/`verify_sha256`). The pure functions are deliberately importable
+without a display — but the module does a top-level `import requests`, so `requests` must be
+installed to import it at all.
 
 ## Architecture
 
