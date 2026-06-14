@@ -51,7 +51,7 @@ import requests
 # /api/oauth/usage is an on-demand endpoint (Claude Code only hits it when you
 # run /usage). The 5h/7d windows move slowly, so polling every 5 min is plenty
 # and — crucially — avoids tripping the endpoint's rate limit. See fetch_usage.
-VERSION = "1.0.0"  # single source of truth; build.ps1 reads this to tag releases
+VERSION = "1.0.1"  # single source of truth; build.ps1 reads this to tag releases
 POLL_SECONDS = 300
 APP_NAME = "ClaudeUsage"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
