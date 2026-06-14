@@ -51,7 +51,7 @@ import requests
 # /api/oauth/usage is an on-demand endpoint (Claude Code only hits it when you
 # run /usage). The 5h/7d windows move slowly, so polling every 5 min is plenty
 # and — crucially — avoids tripping the endpoint's rate limit. See fetch_usage.
-VERSION = "1.0.1"  # single source of truth; build.ps1 reads this to tag releases
+VERSION = "1.0.2"  # single source of truth; build.ps1 reads this to tag releases
 POLL_SECONDS = 300
 APP_NAME = "ClaudeUsage"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -707,19 +707,24 @@ def _uia_setup():
 
 
 def detect_taskbar_obstacles(taskbar_hwnd, taskbar_left, taskbar_width):
-    """Relative-left edges of right-docked taskbar furniture the badge must
-    clear — chiefly the Windows 11 Widgets/weather button, which lives in a
+    """Absolute (screen) left edges of right-docked taskbar furniture the badge
+    must clear — chiefly the Windows 11 Widgets/weather button, which lives in a
     XAML composition island with no HWND, so only UI Automation can see it.
 
     Returns [] when UIA is unavailable (caller falls back to anchoring on the
     tray alone). Targets right-docked ToggleButtons (the Widgets button) and
     ignores the left-clustered app icons / Start / Task View.
+
+    NOTE: this is the one heavy, cross-process call; it must only run on a
+    background thread (never the tk UI thread), so a slow UIA walk can't stall
+    the overlay's message loop. The overlay is not parented into explorer, so a
+    stall here can't hang explorer either.
     """
     setup = _uia_setup()
     if not setup:
         return []
     auto, walker = setup
-    midpoint = taskbar_width // 2
+    midpoint_abs = taskbar_left + taskbar_width // 2
     lefts = []
     try:
         root = auto.ElementFromHandle(taskbar_hwnd)
@@ -732,10 +737,9 @@ def detect_taskbar_obstacles(taskbar_hwnd, taskbar_left, taskbar_width):
                 try:
                     cls = child.CurrentClassName or ""
                     r = child.CurrentBoundingRectangle
-                    rel_left = r.left - taskbar_left
-                    if (cls == "ToggleButton" and rel_left > midpoint
+                    if (cls == "ToggleButton" and r.left > midpoint_abs
                             and (r.right - r.left) > 0):
-                        lefts.append(rel_left)
+                        lefts.append(r.left)        # absolute / screen coords
                 except Exception:
                     pass
                 walk(child, depth + 1)
@@ -765,22 +769,38 @@ def compute_badge_x(obstacle_lefts, badge_w: int, margin: int,
     return max(min(lefts) - badge_w - margin, 0)
 
 
-class TaskbarBadge:
-    """Borderless tkinter window parented into Shell_TrayWnd.
+def should_move(prev, new) -> bool:
+    """True if the overlay's geometry tuple changed (or there's no prior).
+    Lets reposition() skip MoveWindow in the steady state."""
+    return prev != new
 
-    Positioned just left of the tray notification area. Color-key
-    transparency makes only the text visible. Survives explorer restarts
-    (re-embeds) and tray-width changes (repositions). This is the same
-    unsupported technique TrafficMonitor uses; a Windows update could
-    break it, in which case fall back to tray-icon mode.
+
+class TaskbarBadge:
+    """A standalone always-on-top text overlay floating over the taskbar.
+
+    It is deliberately NOT parented into Shell_TrayWnd. An earlier version
+    reparented this window into explorer's taskbar; explorer's UI thread then
+    sent it synchronous messages and would hang waiting on our tk loop whenever
+    the loop stalled (Windows logged AppHangXProcB1 with partner ClaudeUsage.exe
+    and restarted explorer). As an unowned top-level window, explorer never
+    waits on us, so it cannot hang us or be hung by us.
+
+    Positioning uses only non-blocking reads of explorer's window rects
+    (GetWindowRect/FindWindowExW) plus MoveWindow on our OWN window \u2014 none of
+    which couple us to explorer's UI thread. The one heavy call (the UIA widget
+    probe) runs on a background thread, off the tk loop.
     """
 
-    GWL_STYLE = -16
     GWL_EXSTYLE = -20
-    WS_CHILD = 0x40000000
-    WS_POPUP = 0x80000000
     WS_EX_LAYERED = 0x00080000
+    WS_EX_TOOLWINDOW = 0x00000080    # no taskbar/alt-tab entry
+    WS_EX_NOACTIVATE = 0x08000000    # clicks don't steal focus
+    WS_EX_TOPMOST = 0x00000008
     LWA_COLORKEY = 0x1
+    HWND_TOPMOST = -1
+    SWP_NOSIZE = 0x1
+    SWP_NOMOVE = 0x2
+    SWP_NOACTIVATE = 0x10
     MARGIN_RIGHT = 10  # px gap between badge and tray area
 
     def __init__(self, app, debug=False):
@@ -795,8 +815,8 @@ class TaskbarBadge:
         self.tooltip = None
         self.taskbar_hwnd = 0
         self._tick_count = 0
-        self._obstacle_lefts = []   # cached UIA scan of right-docked furniture
-        self._obstacle_age = 999    # force a scan on the first reposition
+        self._obstacle_lefts = []   # absolute lefts from the background UIA probe
+        self._last_geom = None      # (x,y,w,h) of the last MoveWindow; change-gate
 
         # DPI awareness before any window is created, so coords line up
         try:
@@ -806,6 +826,7 @@ class TaskbarBadge:
 
         self.root = tk.Tk()
         self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
         self.root.configure(bg=KEY_COLOR)
         self.label = tk.Label(self.root, text="Claude \u2026", fg=TEXT_STALE,
                               bg=KEY_COLOR, font=("Segoe UI Semibold", 10),
@@ -818,11 +839,38 @@ class TaskbarBadge:
 
         # Real top-level HWND is the wrapper around tk's client window
         self.hwnd = self.u32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-        self.embed()
+        self._apply_overlay_styles()
+        # Probe the Win11 right-docked Widgets button off the UI thread so a slow
+        # UIA walk can never stall the overlay loop (or explorer).
+        threading.Thread(target=self._probe_obstacles, daemon=True).start()
+        self.reposition()
 
     def log(self, msg):
         if self.debug:
             print(f"[badge] {msg}", flush=True)
+
+    def _apply_overlay_styles(self):
+        """Layered (color-key transparent), tool, no-activate, topmost \u2014 a
+        click-through-safe overlay that owns no taskbar entry."""
+        ex = self.u32.GetWindowLongW(self.hwnd, self.GWL_EXSTYLE) & 0xFFFFFFFF
+        ex |= (self.WS_EX_LAYERED | self.WS_EX_TOOLWINDOW
+               | self.WS_EX_NOACTIVATE | self.WS_EX_TOPMOST)
+        self.u32.SetWindowLongW(self.hwnd, self.GWL_EXSTYLE, _signed32(ex))
+        self.u32.SetLayeredWindowAttributes(self.hwnd, KEY_COLORREF, 255,
+                                            self.LWA_COLORKEY)
+
+    def _probe_obstacles(self):
+        """One-shot background UIA scan for the right-docked Widgets button;
+        result is read by reposition() on the UI thread. Best-effort."""
+        try:
+            tb = self.u32.FindWindowW("Shell_TrayWnd", None)
+            r = self._rect(tb) if tb else None
+            if r:
+                self._obstacle_lefts = detect_taskbar_obstacles(
+                    tb, r.left, r.right - r.left)
+                self.log(f"obstacles (abs): {self._obstacle_lefts}")
+        except Exception as e:
+            self.log(f"obstacle probe failed: {e}")
 
     def _declare_prototypes(self, ctypes):
         """Explicit argtypes/restypes for every Win32 call we make.
@@ -839,8 +887,10 @@ class TaskbarBadge:
         u.FindWindowExW.restype = wintypes.HWND
         u.GetParent.argtypes = (wintypes.HWND,)
         u.GetParent.restype = wintypes.HWND
-        u.SetParent.argtypes = (wintypes.HWND, wintypes.HWND)
-        u.SetParent.restype = wintypes.HWND
+        u.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   wintypes.UINT)
+        u.SetWindowPos.restype = wintypes.BOOL
         u.GetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int)
         u.GetWindowLongW.restype = wintypes.LONG
         u.SetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.LONG)
@@ -866,55 +916,42 @@ class TaskbarBadge:
             return None
         return r
 
-    def embed(self):
-        """(Re)parent our window into the taskbar and apply transparency."""
-        self.taskbar_hwnd = self.u32.FindWindowW("Shell_TrayWnd", None)
-        if not self.taskbar_hwnd:
-            raise RuntimeError("Shell_TrayWnd not found (no taskbar?)")
-
-        style = self.u32.GetWindowLongW(self.hwnd, self.GWL_STYLE) & 0xFFFFFFFF
-        style = ((style & ~self.WS_POPUP) | self.WS_CHILD) & 0xFFFFFFFF
-        self.u32.SetWindowLongW(self.hwnd, self.GWL_STYLE, _signed32(style))
-        prev = self.u32.SetParent(self.hwnd, self.taskbar_hwnd)
-        self.log(f"SetParent -> prev parent {prev}")
-
-        ex = self.u32.GetWindowLongW(self.hwnd, self.GWL_EXSTYLE) & 0xFFFFFFFF
-        self.u32.SetWindowLongW(self.hwnd, self.GWL_EXSTYLE,
-                                _signed32(ex | self.WS_EX_LAYERED))
-        self.u32.SetLayeredWindowAttributes(self.hwnd, KEY_COLORREF, 255,
-                                            self.LWA_COLORKEY)
-        self.log(f"embedded hwnd={self.hwnd:#x} into taskbar={self.taskbar_hwnd:#x}")
-        self.reposition()
-
     def reposition(self):
-        tb = self._rect(self.taskbar_hwnd)
+        """Place the overlay just left of the tray, in SCREEN coordinates.
+
+        Uses only non-blocking reads of explorer's window rects + MoveWindow on
+        our own window, then re-asserts topmost (the taskbar is itself topmost
+        and can otherwise cover us). MoveWindow is skipped when geometry is
+        unchanged, so the steady state does almost nothing.
+        """
+        tb = self._rect(self.u32.FindWindowW("Shell_TrayWnd", None))
         if tb is None:
             return
-        tb_w, tb_h = tb.right - tb.left, tb.bottom - tb.top
+        tb_h = tb.bottom - tb.top
 
-        # Tray notification area (left edge), else a 250px fallback.
-        tray = self.u32.FindWindowExW(self.taskbar_hwnd, 0, "TrayNotifyWnd", None)
+        # Tray notification area left edge (screen coords), else a fallback.
+        tray = self.u32.FindWindowExW(self.u32.FindWindowW("Shell_TrayWnd", None),
+                                      0, "TrayNotifyWnd", None)
         tr = self._rect(tray) if tray else None
-        tray_left = (tr.left - tb.left) if tr else (tb_w - 250)
-
-        # Re-scan UIA for right-docked obstacles (the Win11 Widgets/weather
-        # button) only every ~10th reposition — it's relatively expensive and
-        # the button rarely moves. The tray anchor still updates every cycle.
-        self._obstacle_age += 1
-        if self._obstacle_age >= 10:
-            self._obstacle_age = 0
-            self._obstacle_lefts = detect_taskbar_obstacles(
-                self.taskbar_hwnd, tb.left, tb_w)
+        tray_left = tr.left if tr else (tb.right - 250)
 
         self.root.update_idletasks()
         w = self.label.winfo_reqwidth()
         h = self.label.winfo_reqheight()
         x = compute_badge_x([tray_left] + self._obstacle_lefts, w,
                             self.MARGIN_RIGHT)
-        y = max((tb_h - h) // 2, 0)
-        self.u32.MoveWindow(self.hwnd, x, y, w, h, True)
-        self.log(f"taskbar {tb_w}x{tb_h}, tray-left={tray_left}, "
-                 f"obstacles={self._obstacle_lefts}, badge at ({x},{y}) {w}x{h}")
+        y = tb.top + max((tb_h - h) // 2, 0)
+
+        geom = (x, y, w, h)
+        if should_move(self._last_geom, geom):
+            self.u32.MoveWindow(self.hwnd, x, y, w, h, True)
+            self._last_geom = geom
+            self.log(f"moved to ({x},{y}) {w}x{h}; tray_left={tray_left}, "
+                     f"obstacles={self._obstacle_lefts}")
+        # Keep above the (topmost) taskbar without moving/resizing/activating.
+        self.u32.SetWindowPos(self.hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
+                              self.SWP_NOMOVE | self.SWP_NOSIZE
+                              | self.SWP_NOACTIVATE)
 
     # -- interactions ---------------------------------------------------------
     def on_click(self, _event):
@@ -955,18 +992,15 @@ class TaskbarBadge:
         self.label.config(text=build_badge_text(self.app.usage, self.app.stale),
                           fg=pick_text_color(pct, self.app.stale))
 
-        # Every ~3s: verify the taskbar still exists (explorer restart) and
-        # track tray-width changes
+        # Every ~3s: re-resolve the taskbar and reposition (handles explorer
+        # restarts and tray-width changes — no re-embed needed since we're not
+        # parented into the taskbar).
         self._tick_count += 1
         if self._tick_count % 4 == 0:
             try:
-                if not self.u32.IsWindow(self.taskbar_hwnd):
-                    self.log("taskbar gone; re-embedding")
-                    self.embed()
-                else:
-                    self.reposition()
+                self.reposition()
             except Exception as e:
-                self.log(f"re-embed failed: {e}")
+                self.log(f"reposition failed: {e}")
 
         self.root.after(750, self.tick)
 

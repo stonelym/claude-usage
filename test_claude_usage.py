@@ -92,6 +92,17 @@ class TooltipRateLimited(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Bug 2: collision-aware taskbar badge positioning
 # ---------------------------------------------------------------------------
+class ShouldMove(unittest.TestCase):
+    def test_no_move_when_geometry_unchanged(self):
+        self.assertFalse(cu.should_move((100, 10, 97, 23), (100, 10, 97, 23)))
+
+    def test_move_when_changed(self):
+        self.assertTrue(cu.should_move((100, 10, 97, 23), (90, 10, 97, 23)))
+
+    def test_move_on_first_call_no_prev(self):
+        self.assertTrue(cu.should_move(None, (100, 10, 97, 23)))
+
+
 class ComputeBadgeX(unittest.TestCase):
     def test_anchors_left_of_single_obstacle(self):
         # tray at relative-left 2345, badge 97 wide, 10px margin

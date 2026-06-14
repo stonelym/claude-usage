@@ -50,10 +50,10 @@ importable without a display — but the module does a top-level `import request
 
 The app has **two display modes** that run simultaneously when possible:
 
-1. **Taskbar text badge** (`TaskbarBadge`, default on, Windows-only) — a borderless
-   tkinter window reparented into `Shell_TrayWnd` so text paints directly on the taskbar
-   left of the tray. Pure Win32 via `ctypes`. Falls back silently to mode 2 if the embed
-   throws.
+1. **Taskbar text badge** (`TaskbarBadge`, default on, Windows-only) — a borderless,
+   always-on-top tkinter overlay floating over the taskbar just left of the tray. It is
+   **NOT** parented into `Shell_TrayWnd` (see the warning below). Pure Win32 via `ctypes`.
+   Falls back silently to mode 2 if it throws.
 2. **Tray icon** (`pystray`, always on) — colored square showing session %, owns the
    right-click menu and toast notifications.
 
@@ -123,19 +123,25 @@ tick but doesn't own it.
 - `TaskbarBadge._declare_prototypes` sets explicit `argtypes`/`restype` for every Win32
   call — required so HWNDs aren't truncated on 64-bit Python. New Win32 calls need an entry
   here.
-- The badge re-embeds after explorer restarts and repositions as the tray resizes (checked
-  every ~3s in `tick`). This embed is an unsupported, deprecated-DeskBand-style technique;
-  a Windows update could break it, which is why tray-icon mode always stays on.
-- **Badge positioning is collision-aware (Win11).** On Windows 11 the visible taskbar is
-  painted by a single full-width `Windows.UI.Composition.DesktopWindowContentBridge`; the
-  Widgets/weather button lives inside that XAML island with **no HWND**, so Win32/MSAA
-  can't see it. `detect_taskbar_obstacles` uses **UI Automation** (`comtypes`) to find
-  right-docked ToggleButtons and feeds their left edges, plus the tray's, into the pure
-  `compute_badge_x` so the badge anchors clear of all of them. The UIA object is cached
-  (`_uia`), the scan is throttled to ~every 10th reposition, and any UIA failure degrades
-  gracefully to a tray-only anchor. `comtypes` generates a typelib wrapper at first use;
-  when frozen, `_uia_setup` redirects `gen_dir` to `%APPDATA%\ClaudeUsage\comtypes_gen`
-  because site-packages is read-only in a `--onefile` exe.
+- **NEVER reparent the badge into `Shell_TrayWnd`** (no `SetParent`/`WS_CHILD`). A previous
+  version did, which made our window a child of explorer's taskbar; explorer's UI thread
+  then sent it synchronous messages and **hung waiting on our tk loop** whenever the loop
+  stalled — Windows logged `AppHangXProcB1` (partner `ClaudeUsage.exe`) and restarted
+  explorer. The badge is now a standalone `WS_EX_TOPMOST | TOOLWINDOW | NOACTIVATE | LAYERED`
+  overlay positioned in **screen coords** via non-blocking reads (`GetWindowRect`/
+  `FindWindowExW`) + `MoveWindow` on our own window + a periodic `SetWindowPos(HWND_TOPMOST)`
+  re-assert. `reposition` skips `MoveWindow` when geometry is unchanged (`should_move`).
+  Explorer never waits on an unowned window, so it can't hang us or be hung by us.
+- **Badge positioning is collision-aware (Win11).** On Windows 11 the Widgets/weather button
+  lives in a XAML composition island with **no HWND**, so Win32 can't see it.
+  `detect_taskbar_obstacles` uses **UI Automation** (`comtypes`) to find right-docked
+  ToggleButtons; their absolute left edges feed the pure `compute_badge_x` so the overlay
+  clears them. This UIA walk is the one heavy cross-process call, so it runs **once on a
+  background daemon thread** (`_probe_obstacles`), never on the tk loop — a slow walk can't
+  stall the overlay (and, since we're unparented, can't hang explorer). Result is cached for
+  `reposition` to read; UIA failure degrades to a tray-only anchor. `comtypes` generates a
+  typelib wrapper at first use; when frozen, `_uia_setup` redirects `gen_dir` to
+  `%APPDATA%\ClaudeUsage\comtypes_gen` (site-packages is read-only in a `--onefile` exe).
 - Startup-at-login is an HKCU `...\Run` entry (`set_startup`/`is_startup_enabled`), which
   is what surfaces the app in Task Manager > Startup apps.
 
