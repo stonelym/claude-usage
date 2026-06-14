@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime-generated (comtypes UIA wrapper cache redirected here when frozen)
+comtypes_gen/
+
+# Local Claude Code settings
+.claude/
+
+# Local planning notes
+plan-*.md
