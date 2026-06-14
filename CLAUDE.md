@@ -132,6 +132,15 @@ tick but doesn't own it.
   `FindWindowExW`) + `MoveWindow` on our own window + a periodic `SetWindowPos(HWND_TOPMOST)`
   re-assert. `reposition` skips `MoveWindow` when geometry is unchanged (`should_move`).
   Explorer never waits on an unowned window, so it can't hang us or be hung by us.
+- **Topmost is re-asserted on a fast ~120ms timer** (`_topmost_tick` → `_assert_topmost`),
+  separate from the 750ms `tick`. Without it, clicking a taskbar item raises the (topmost)
+  taskbar above the overlay and it stays buried until the next ~3s `reposition` — the
+  "blinks away on click" bug. A `SetWinEventHook` was rejected: `WINEVENT_OUTOFCONTEXT`
+  callbacks aren't reliably dispatched by tk's mainloop and would need a separate pump
+  thread. The re-assert is a Z-only, non-activating `SetWindowPos` (no repaint, doesn't eat
+  clicks). A **fullscreen guard** (`_foreground_is_fullscreen` via `GetForegroundWindow` +
+  `MonitorFromWindow`/`GetMonitorInfoW` + the pure `is_fullscreen`) withdraws the overlay
+  while a fullscreen app is foreground, so the aggressive topmost doesn't cover videos/games.
 - **Badge positioning is collision-aware (Win11).** On Windows 11 the Widgets/weather button
   lives in a XAML composition island with **no HWND**, so Win32 can't see it.
   `detect_taskbar_obstacles` uses **UI Automation** (`comtypes`) to find right-docked

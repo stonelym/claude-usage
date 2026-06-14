@@ -103,6 +103,28 @@ class ShouldMove(unittest.TestCase):
         self.assertTrue(cu.should_move(None, (100, 10, 97, 23)))
 
 
+class IsFullscreen(unittest.TestCase):
+    MON = (0, 0, 2560, 1440)
+
+    def test_exact_cover_is_fullscreen(self):
+        self.assertTrue(cu.is_fullscreen((0, 0, 2560, 1440), self.MON))
+
+    def test_smaller_window_is_not(self):
+        self.assertFalse(cu.is_fullscreen((100, 100, 800, 600), self.MON))
+
+    def test_partial_height_is_not(self):
+        # leaves the taskbar band uncovered
+        self.assertFalse(cu.is_fullscreen((0, 0, 2560, 1400), self.MON))
+
+    def test_window_spilling_past_monitor_is_fullscreen(self):
+        # borderless fullscreen often sits a few px outside the monitor
+        self.assertTrue(cu.is_fullscreen((-8, -8, 2568, 1448), self.MON))
+
+    def test_fullscreen_on_secondary_monitor(self):
+        mon = (2560, 0, 5120, 1440)
+        self.assertTrue(cu.is_fullscreen((2560, 0, 5120, 1440), mon))
+
+
 class ComputeBadgeX(unittest.TestCase):
     def test_anchors_left_of_single_obstacle(self):
         # tray at relative-left 2345, badge 97 wide, 10px margin

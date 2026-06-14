@@ -51,7 +51,7 @@ import requests
 # /api/oauth/usage is an on-demand endpoint (Claude Code only hits it when you
 # run /usage). The 5h/7d windows move slowly, so polling every 5 min is plenty
 # and — crucially — avoids tripping the endpoint's rate limit. See fetch_usage.
-VERSION = "1.0.2"  # single source of truth; build.ps1 reads this to tag releases
+VERSION = "1.0.3"  # single source of truth; build.ps1 reads this to tag releases
 POLL_SECONDS = 300
 APP_NAME = "ClaudeUsage"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -775,6 +775,15 @@ def should_move(prev, new) -> bool:
     return prev != new
 
 
+def is_fullscreen(win_rect, monitor_rect) -> bool:
+    """True if win_rect covers (>=) its monitor — a fullscreen app/video/game.
+    Rects are (left, top, right, bottom). Borderless-fullscreen windows often
+    spill a few px past the monitor, so use coverage, not equality."""
+    wl, wt, wr, wb = win_rect
+    ml, mt, mr, mb = monitor_rect
+    return wl <= ml and wt <= mt and wr >= mr and wb >= mb
+
+
 class TaskbarBadge:
     """A standalone always-on-top text overlay floating over the taskbar.
 
@@ -801,7 +810,9 @@ class TaskbarBadge:
     SWP_NOSIZE = 0x1
     SWP_NOMOVE = 0x2
     SWP_NOACTIVATE = 0x10
+    MONITOR_DEFAULTTONEAREST = 0x2
     MARGIN_RIGHT = 10  # px gap between badge and tray area
+    TOPMOST_MS = 120   # re-assert topmost this often so taskbar clicks can't bury us
 
     def __init__(self, app, debug=False):
         import ctypes
@@ -817,6 +828,7 @@ class TaskbarBadge:
         self._tick_count = 0
         self._obstacle_lefts = []   # absolute lefts from the background UIA probe
         self._last_geom = None      # (x,y,w,h) of the last MoveWindow; change-gate
+        self._hidden = False        # withdrawn because a fullscreen app is foreground
 
         # DPI awareness before any window is created, so coords line up
         try:
@@ -879,6 +891,12 @@ class TaskbarBadge:
         on 64-bit Python, and 32-bit style masks raise OverflowError.
         """
         from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+        self._MONITORINFO = MONITORINFO
+
         u = self.u32
         u.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
         u.FindWindowW.restype = wintypes.HWND
@@ -906,6 +924,14 @@ class TaskbarBadge:
         u.GetWindowRect.restype = wintypes.BOOL
         u.IsWindow.argtypes = (wintypes.HWND,)
         u.IsWindow.restype = wintypes.BOOL
+        # Foreground + monitor lookup for the fullscreen guard.
+        u.GetForegroundWindow.argtypes = ()
+        u.GetForegroundWindow.restype = wintypes.HWND
+        u.MonitorFromWindow.argtypes = (wintypes.HWND, wintypes.DWORD)
+        u.MonitorFromWindow.restype = wintypes.HANDLE
+        u.GetMonitorInfoW.argtypes = (wintypes.HANDLE,
+                                      ctypes.POINTER(MONITORINFO))
+        u.GetMonitorInfoW.restype = wintypes.BOOL
 
     # -- win32 plumbing -------------------------------------------------------
     def _rect(self, hwnd):
@@ -948,10 +974,59 @@ class TaskbarBadge:
             self._last_geom = geom
             self.log(f"moved to ({x},{y}) {w}x{h}; tray_left={tray_left}, "
                      f"obstacles={self._obstacle_lefts}")
-        # Keep above the (topmost) taskbar without moving/resizing/activating.
+        self._assert_topmost()
+
+    def _foreground_is_fullscreen(self) -> bool:
+        """True if the foreground window covers its whole monitor (video/game).
+        Best-effort; any failure → False (treat as not fullscreen)."""
+        import ctypes
+        try:
+            fg = self.u32.GetForegroundWindow()
+            if not fg or fg == self.hwnd:
+                return False
+            wr = self._rect(fg)
+            if wr is None:
+                return False
+            mon = self.u32.MonitorFromWindow(fg, self.MONITOR_DEFAULTTONEAREST)
+            mi = self._MONITORINFO()
+            mi.cbSize = ctypes.sizeof(self._MONITORINFO)
+            if not self.u32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                return False
+            m = mi.rcMonitor
+            return is_fullscreen((wr.left, wr.top, wr.right, wr.bottom),
+                                 (m.left, m.top, m.right, m.bottom))
+        except Exception:
+            return False
+
+    def _assert_topmost(self):
+        """Pop the overlay back above the (topmost) taskbar — clicking the
+        taskbar otherwise raises it over us. Skipped (and the overlay hidden)
+        while a fullscreen app is foreground, mirroring the taskbar's auto-hide.
+        A Z-only, non-activating change: cheap, no repaint, doesn't eat clicks."""
+        if self._foreground_is_fullscreen():
+            if not self._hidden:
+                self.root.withdraw()
+                self._hidden = True
+            return
+        if self._hidden:
+            self.root.deiconify()
+            self._hidden = False
+            self._last_geom = None      # force a reposition after re-showing
         self.u32.SetWindowPos(self.hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
                               self.SWP_NOMOVE | self.SWP_NOSIZE
                               | self.SWP_NOACTIVATE)
+
+    def _topmost_tick(self):
+        """Fast, cheap loop that keeps the overlay above the taskbar so a
+        taskbar click can't bury it for seconds. Separate from the 750ms tick;
+        only does the topmost re-assert, not the heavier reposition()."""
+        if self.app.stop.is_set():
+            return
+        try:
+            self._assert_topmost()
+        except Exception as e:
+            self.log(f"topmost re-assert failed: {e}")
+        self.root.after(self.TOPMOST_MS, self._topmost_tick)
 
     # -- interactions ---------------------------------------------------------
     def on_click(self, _event):
@@ -1006,6 +1081,7 @@ class TaskbarBadge:
 
     def run(self):
         self.root.after(100, self.tick)
+        self.root.after(150, self._topmost_tick)
         self.root.mainloop()
 
 
