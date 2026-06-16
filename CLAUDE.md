@@ -47,7 +47,8 @@ entry (the same value the tray toggle uses) and a Start Menu shortcut.
 
 Tests live in `test_claude_usage.py` (stdlib `unittest`, no extra deps). They cover the
 display-free logic: usage parsing, 429/Retry-After classification, poll-backoff math, the
-single-instance guard, badge-position math (`compute_badge_x`/`should_move`/`is_fullscreen`),
+single-instance guard, badge-position math (`compute_badge_x`/`should_move`/`is_fullscreen`/
+`select_taskbar`),
 and the self-update helpers (`parse_version`/`is_newer_version`/`select_release_assets`/
 `parse_sha256_sidecar`/`verify_sha256`). The pure functions are deliberately importable
 without a display — but the module does a top-level `import requests`, so `requests` must be
@@ -92,9 +93,13 @@ tick but doesn't own it.
   on-demand (Claude Code's `/usage`), not polled. `POLL_SECONDS` is therefore **300**, not
   60 — do not lower it. `fetch_usage()` returns a `FetchResult` (`ok` / `auth` /
   `rate_limited` / `error`), not a bare dict/None. On a 429, `poll_loop` honors the
-  server's `Retry-After` via `compute_next_wait` so the rolling limit can drain; polling
-  straight through a 429 keeps the account permanently limited. `poll_once` also refuses to
-  hit the endpoint while still inside a cooldown (so a manual "Refresh" can't re-arm it).
+  server's `Retry-After` and, via `compute_next_wait`, **backs off exponentially on
+  consecutive 429s** (`rate_limit_streak`: 300s → 600 → 1200 … capped at 1h) so the rolling
+  limit can actually drain; retrying flat every 300s keeps re-tripping an account-wide
+  window that needs longer than that to clear (the "constantly stale" failure mode).
+  `poll_once` also refuses to hit the endpoint while still inside a cooldown (so a manual
+  "Refresh" can't re-arm it); `--debug` emits `[poll]` lines (HTTP status, kind, streak,
+  backoff) so a stuck-stale state is diagnosable on the live machine.
   The rate-limited state is surfaced in the tooltip ("Rate-limited, retry HH:MM"), not
   muted to `—`.
 - **Single instance only** (`acquire_single_instance`, a named mutex). Two instances both
@@ -146,9 +151,21 @@ tick but doesn't own it.
   "blinks away on click" bug. A `SetWinEventHook` was rejected: `WINEVENT_OUTOFCONTEXT`
   callbacks aren't reliably dispatched by tk's mainloop and would need a separate pump
   thread. The re-assert is a Z-only, non-activating `SetWindowPos` (no repaint, doesn't eat
-  clicks). A **fullscreen guard** (`_foreground_is_fullscreen` via `GetForegroundWindow` +
+  clicks). A **fullscreen guard** (`_fullscreen_on_badge_monitor` via `GetForegroundWindow` +
   `MonitorFromWindow`/`GetMonitorInfoW` + the pure `is_fullscreen`) withdraws the overlay
   while a fullscreen app is foreground, so the aggressive topmost doesn't cover videos/games.
+  It is **monitor-scoped**: it compares the foreground window's `HMONITOR` to the badge's
+  (the docked taskbar's, `_dock_hwnd`) and only hides when they match — a fullscreen app on
+  another display leaves the badge visible.
+- **The badge can dock to a chosen display (multi-monitor).** It floats over a taskbar, so it
+  can live on any monitor that has one: the primary `Shell_TrayWnd` or a secondary monitor's
+  `Shell_SecondaryTrayWnd` (present only with Windows' "Show my taskbar on all displays").
+  `enumerate_taskbar_displays()` lists those taskbars (HWND + monitor `szDevice` + primary
+  flag) and the pure `select_taskbar` picks the one matching `config["display"]`, falling
+  back to primary if it's gone. `reposition` reads this each tick so the tray menu's "Show on
+  display" submenu applies **live**. On a secondary taskbar (no `TrayNotifyWnd`, no Widgets
+  button) the badge anchors via the right-edge fallback; the cached Widgets obstacles are
+  folded in **only** when docked to the primary (they're in primary-monitor coords).
 - **Badge positioning is collision-aware (Win11).** On Windows 11 the Widgets/weather button
   lives in a XAML composition island with **no HWND**, so Win32 can't see it.
   `detect_taskbar_obstacles` uses **UI Automation** (`comtypes`) to find right-docked
@@ -164,9 +181,13 @@ tick but doesn't own it.
 
 ### Config
 
-`%APPDATA%\ClaudeUsage\config.json` holds `{"taskbar": bool, "last_update_check": float}`.
+`%APPDATA%\ClaudeUsage\config.json` holds
+`{"taskbar": bool, "last_update_check": float, "display": str|null}`.
 Taskbar mode defaults ON. The "Show on taskbar" toggle persists but only applies on next
-launch. `last_update_check` (epoch seconds) throttles the daily release check.
+launch. `last_update_check` (epoch seconds) throttles the daily release check. `display` is
+the monitor device name (e.g. `\\.\DISPLAY2`) the badge docks to, set by the "Show on
+display" menu; absent/`null` means follow the primary taskbar. Unlike the taskbar toggle,
+the display choice applies live (`reposition` reads it each tick).
 
 ## Conventions
 

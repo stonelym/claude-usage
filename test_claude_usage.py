@@ -71,6 +71,35 @@ class ComputeNextWait(unittest.TestCase):
         res = cu.FetchResult("ok", usage={})
         self.assertEqual(cu.compute_next_wait(res, base_poll=300), 300)
 
+    def test_streak_zero_or_one_is_base(self):
+        # First 429 (streak 1) still backs off only to the base interval.
+        res = cu.FetchResult("rate_limited", retry_after=None)
+        self.assertEqual(cu.compute_next_wait(res, base_poll=300, streak=0), 300)
+        self.assertEqual(cu.compute_next_wait(res, base_poll=300, streak=1), 300)
+
+    def test_streak_doubles_each_consecutive_429(self):
+        res = cu.FetchResult("rate_limited", retry_after=None)
+        self.assertEqual(cu.compute_next_wait(res, base_poll=300, streak=2), 600)
+        self.assertEqual(cu.compute_next_wait(res, base_poll=300, streak=3), 1200)
+        self.assertEqual(cu.compute_next_wait(res, base_poll=300, streak=4), 2400)
+
+    def test_backoff_is_capped(self):
+        res = cu.FetchResult("rate_limited", retry_after=None)
+        # 300 * 2**9 would be 153600; the cap holds it at 3600.
+        self.assertEqual(
+            cu.compute_next_wait(res, base_poll=300, streak=10, cap=3600), 3600)
+
+    def test_server_retry_after_overrides_backoff(self):
+        # A Retry-After longer than the computed backoff still wins.
+        res = cu.FetchResult("rate_limited", retry_after=5000)
+        self.assertEqual(cu.compute_next_wait(res, base_poll=300, streak=2), 5000)
+
+    def test_non_rate_limited_ignores_streak(self):
+        for kind in ("ok", "auth", "error"):
+            res = cu.FetchResult(kind, usage={})
+            self.assertEqual(
+                cu.compute_next_wait(res, base_poll=300, streak=9), 300)
+
 
 class TooltipRateLimited(unittest.TestCase):
     def test_no_data_but_rate_limited_explains_why(self):
@@ -123,6 +152,31 @@ class IsFullscreen(unittest.TestCase):
     def test_fullscreen_on_secondary_monitor(self):
         mon = (2560, 0, 5120, 1440)
         self.assertTrue(cu.is_fullscreen((2560, 0, 5120, 1440), mon))
+
+
+class SelectTaskbar(unittest.TestCase):
+    PRIMARY = {"hwnd": 1, "device": r"\\.\DISPLAY1", "is_primary": True}
+    SECONDARY = {"hwnd": 2, "device": r"\\.\DISPLAY2", "is_primary": False}
+
+    def test_matches_wanted_device(self):
+        bars = [self.PRIMARY, self.SECONDARY]
+        self.assertIs(cu.select_taskbar(bars, r"\\.\DISPLAY2"), self.SECONDARY)
+
+    def test_falls_back_to_primary_when_wanted_absent(self):
+        # Saved display was disconnected/renamed -> don't vanish, use primary.
+        bars = [self.PRIMARY, self.SECONDARY]
+        self.assertIs(cu.select_taskbar(bars, r"\\.\DISPLAY9"), self.PRIMARY)
+
+    def test_no_wanted_uses_primary(self):
+        bars = [self.SECONDARY, self.PRIMARY]
+        self.assertIs(cu.select_taskbar(bars, None), self.PRIMARY)
+
+    def test_falls_back_to_first_when_no_primary(self):
+        bars = [self.SECONDARY]
+        self.assertIs(cu.select_taskbar(bars, None), self.SECONDARY)
+
+    def test_none_when_no_taskbars(self):
+        self.assertIsNone(cu.select_taskbar([], r"\\.\DISPLAY1"))
 
 
 class ComputeBadgeX(unittest.TestCase):

@@ -288,11 +288,20 @@ def classify_usage_response(status_code: int, headers, json_loader) -> FetchResu
     return FetchResult("error")
 
 
-def compute_next_wait(result: FetchResult, base_poll: int) -> int:
-    """Seconds until the next poll. After a 429, wait at least the server's
-    Retry-After so the rolling rate-limit window can actually drain."""
-    if result.kind == "rate_limited" and result.retry_after:
-        return max(base_poll, result.retry_after)
+def compute_next_wait(result: FetchResult, base_poll: int,
+                      streak: int = 0, cap: int = 3600) -> int:
+    """Seconds until the next poll.
+
+    After a 429 we back off exponentially on *consecutive* rate-limits
+    (`streak`): base, base, 2x, 4x ... capped at `cap`. The usage endpoint
+    limits account-wide and aggressively, so retrying flat every `base_poll`
+    can keep re-tripping a rolling window that needs longer to drain (the app
+    then never escapes "stale"). The wait is always at least the server's
+    Retry-After when it sends one. `streak<=1` keeps the original base
+    interval so a single transient 429 doesn't over-penalize."""
+    if result.kind == "rate_limited":
+        backoff = min(base_poll * 2 ** max(0, streak - 1), cap)
+        return max(backoff, result.retry_after or 0)
     return base_poll
 
 
@@ -562,16 +571,22 @@ def refresh_token():
     return access
 
 
-def fetch_usage() -> FetchResult:
+def fetch_usage(log=None) -> FetchResult:
     """GET usage as a FetchResult; one 401-triggered refresh retry.
 
     A 429 returns kind "rate_limited" with the server's Retry-After so the
     caller can back off; everything else that isn't a clean 200 is "error"
-    (keep last-known numbers, gray them out).
+    (keep last-known numbers, gray them out). `log` is an optional callable
+    (str)->None used to surface the raw HTTP status / network errors so a
+    persistent "stale" state can be diagnosed via --debug.
     """
+    def _emit(msg):
+        if log:
+            log(msg)
     creds = read_credentials()
     token = ((creds or {}).get("claudeAiOauth") or {}).get("accessToken")
     if not token:
+        _emit("no access token in credentials -> auth")
         return FetchResult("auth")
     for attempt in (1, 2):
         try:
@@ -585,12 +600,16 @@ def fetch_usage() -> FetchResult:
                 },
                 timeout=15,
             )
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _emit(f"GET usage raised {e!r} (attempt {attempt}) -> error")
             return FetchResult("error")
+        _emit(f"GET usage -> HTTP {r.status_code} (attempt {attempt})")
         res = classify_usage_response(r.status_code, r.headers, r.json)
         if res.kind == "auth" and attempt == 1:
+            _emit("401 -> refreshing token")
             token = refresh_token()
             if not token:
+                _emit("token refresh failed -> auth")
                 return FetchResult("auth")
             continue
         return res
@@ -751,6 +770,75 @@ def detect_taskbar_obstacles(taskbar_hwnd, taskbar_left, taskbar_width):
     return lefts
 
 
+def enumerate_taskbar_displays():
+    r"""Displays that currently host a Windows taskbar — the only places the
+    badge can dock (it floats over a taskbar).
+
+    Returns a list of {hwnd, device, is_primary, label, rect}, primary first.
+    The primary taskbar is `Shell_TrayWnd`; each secondary monitor's taskbar
+    is a `Shell_SecondaryTrayWnd` (present only when "Show my taskbar on all
+    displays" is enabled). `device` (e.g. r"\\.\DISPLAY2") is the stable key we
+    persist. Windows-only; non-blocking reads, so it's safe on the tk thread.
+    Returns [] off Windows or on any failure (caller anchors to primary)."""
+    if sys.platform != "win32":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    class MONITORINFOEX(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD),
+                    ("szDevice", wintypes.WCHAR * 32)]
+
+    MONITOR_DEFAULTTONEAREST = 0x2
+    MONITORINFOF_PRIMARY = 0x1
+    try:
+        u = ctypes.windll.user32
+        u.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+        u.FindWindowW.restype = wintypes.HWND
+        u.FindWindowExW.argtypes = (wintypes.HWND, wintypes.HWND,
+                                    wintypes.LPCWSTR, wintypes.LPCWSTR)
+        u.FindWindowExW.restype = wintypes.HWND
+        u.MonitorFromWindow.argtypes = (wintypes.HWND, wintypes.DWORD)
+        u.MonitorFromWindow.restype = wintypes.HANDLE
+        u.GetMonitorInfoW.argtypes = (wintypes.HANDLE,
+                                      ctypes.POINTER(MONITORINFOEX))
+        u.GetMonitorInfoW.restype = wintypes.BOOL
+
+        hwnds = []
+        prim = u.FindWindowW("Shell_TrayWnd", None)
+        if prim:
+            hwnds.append(prim)
+        h = 0
+        while True:
+            h = u.FindWindowExW(0, h, "Shell_SecondaryTrayWnd", None)
+            if not h:
+                break
+            hwnds.append(h)
+
+        out = []
+        for hwnd in hwnds:
+            mon = u.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            mi = MONITORINFOEX()
+            mi.cbSize = ctypes.sizeof(MONITORINFOEX)
+            if not u.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                continue
+            device = mi.szDevice
+            is_primary = bool(mi.dwFlags & MONITORINFOF_PRIMARY)
+            r = mi.rcMonitor
+            m = re.search(r"(\d+)$", device or "")
+            label = f"Display {m.group(1)}" if m else (device or "Display")
+            if is_primary:
+                label += " (primary)"
+            out.append({"hwnd": int(hwnd), "device": device,
+                        "is_primary": is_primary, "label": label,
+                        "rect": (r.left, r.top, r.right, r.bottom)})
+        out.sort(key=lambda t: not t["is_primary"])   # primary first
+        return out
+    except Exception:
+        return []
+
+
 def compute_badge_x(obstacle_lefts, badge_w: int, margin: int,
                     fallback_left=None) -> int:
     """X for the badge so it sits clear of every right-docked obstacle.
@@ -782,6 +870,27 @@ def is_fullscreen(win_rect, monitor_rect) -> bool:
     wl, wt, wr, wb = win_rect
     ml, mt, mr, mb = monitor_rect
     return wl <= ml and wt <= mt and wr >= mr and wb >= mb
+
+
+def select_taskbar(taskbars, wanted_device):
+    """Pick which taskbar the badge should dock to.
+
+    `taskbars` is the list from enumerate_taskbar_displays() — dicts with at
+    least `device` (monitor device name) and `is_primary`. Prefers the entry
+    matching `wanted_device` (the user's saved choice); falls back to the
+    primary taskbar, then the first available, so a disconnected/renamed
+    display degrades to the primary instead of vanishing. Returns the chosen
+    dict, or None when no taskbar exists at all."""
+    if not taskbars:
+        return None
+    if wanted_device:
+        for t in taskbars:
+            if t.get("device") == wanted_device:
+                return t
+    for t in taskbars:
+        if t.get("is_primary"):
+            return t
+    return taskbars[0]
 
 
 class TaskbarBadge:
@@ -829,6 +938,7 @@ class TaskbarBadge:
         self._obstacle_lefts = []   # absolute lefts from the background UIA probe
         self._last_geom = None      # (x,y,w,h) of the last MoveWindow; change-gate
         self._hidden = False        # withdrawn because a fullscreen app is foreground
+        self._dock_hwnd = 0         # taskbar HWND we're docked to (which monitor)
 
         # DPI awareness before any window is created, so coords line up
         try:
@@ -945,27 +1055,39 @@ class TaskbarBadge:
     def reposition(self):
         """Place the overlay just left of the tray, in SCREEN coordinates.
 
-        Uses only non-blocking reads of explorer's window rects + MoveWindow on
-        our own window, then re-asserts topmost (the taskbar is itself topmost
-        and can otherwise cover us). MoveWindow is skipped when geometry is
-        unchanged, so the steady state does almost nothing.
+        Docks to the taskbar of the user's chosen display (config["display"],
+        read each call so the choice applies live), falling back to the primary
+        taskbar. Uses only non-blocking reads of explorer's window rects +
+        MoveWindow on our own window, then re-asserts topmost (the taskbar is
+        itself topmost and can otherwise cover us). MoveWindow is skipped when
+        geometry is unchanged, so the steady state does almost nothing.
         """
-        tb = self._rect(self.u32.FindWindowW("Shell_TrayWnd", None))
+        chosen = select_taskbar(enumerate_taskbar_displays(),
+                                self.app.config.get("display"))
+        tb_hwnd = chosen["hwnd"] if chosen else self.u32.FindWindowW(
+            "Shell_TrayWnd", None)
+        tb = self._rect(tb_hwnd)
         if tb is None:
             return
+        self._dock_hwnd = tb_hwnd      # which monitor the badge now lives on
         tb_h = tb.bottom - tb.top
 
         # Tray notification area left edge (screen coords), else a fallback.
-        tray = self.u32.FindWindowExW(self.u32.FindWindowW("Shell_TrayWnd", None),
-                                      0, "TrayNotifyWnd", None)
+        # Secondary taskbars have no TrayNotifyWnd, so the fallback (reserve a
+        # strip at the right) is what anchors the badge there, clear of the clock.
+        tray = self.u32.FindWindowExW(tb_hwnd, 0, "TrayNotifyWnd", None)
         tr = self._rect(tray) if tray else None
         tray_left = tr.left if tr else (tb.right - 250)
+
+        # The cached Widgets-button obstacles are primary-taskbar, primary-
+        # monitor coords; only fold them in when docked to the primary, else
+        # compute_badge_x's min() would drag the badge back to the primary.
+        obstacles = self._obstacle_lefts if (chosen and chosen["is_primary"]) else []
 
         self.root.update_idletasks()
         w = self.label.winfo_reqwidth()
         h = self.label.winfo_reqheight()
-        x = compute_badge_x([tray_left] + self._obstacle_lefts, w,
-                            self.MARGIN_RIGHT)
+        x = compute_badge_x([tray_left] + obstacles, w, self.MARGIN_RIGHT)
         y = tb.top + max((tb_h - h) // 2, 0)
 
         geom = (x, y, w, h)
@@ -973,24 +1095,30 @@ class TaskbarBadge:
             self.u32.MoveWindow(self.hwnd, x, y, w, h, True)
             self._last_geom = geom
             self.log(f"moved to ({x},{y}) {w}x{h}; tray_left={tray_left}, "
-                     f"obstacles={self._obstacle_lefts}")
+                     f"obstacles={obstacles}, dock={tb_hwnd}")
         self._assert_topmost()
 
-    def _foreground_is_fullscreen(self) -> bool:
-        """True if the foreground window covers its whole monitor (video/game).
-        Best-effort; any failure → False (treat as not fullscreen)."""
+    def _fullscreen_on_badge_monitor(self) -> bool:
+        """True only if a fullscreen app/video/game is foreground *on the same
+        monitor as the badge*. A fullscreen window on another display must not
+        hide us (the reported dual-monitor bug). Best-effort; any failure →
+        False (treat as not fullscreen)."""
         import ctypes
         try:
             fg = self.u32.GetForegroundWindow()
             if not fg or fg == self.hwnd:
                 return False
+            fg_mon = self.u32.MonitorFromWindow(fg, self.MONITOR_DEFAULTTONEAREST)
+            badge_mon = self.u32.MonitorFromWindow(
+                self._dock_hwnd or self.hwnd, self.MONITOR_DEFAULTTONEAREST)
+            if fg_mon != badge_mon:
+                return False           # fullscreen app is on a different display
             wr = self._rect(fg)
             if wr is None:
                 return False
-            mon = self.u32.MonitorFromWindow(fg, self.MONITOR_DEFAULTTONEAREST)
             mi = self._MONITORINFO()
             mi.cbSize = ctypes.sizeof(self._MONITORINFO)
-            if not self.u32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+            if not self.u32.GetMonitorInfoW(fg_mon, ctypes.byref(mi)):
                 return False
             m = mi.rcMonitor
             return is_fullscreen((wr.left, wr.top, wr.right, wr.bottom),
@@ -1001,9 +1129,11 @@ class TaskbarBadge:
     def _assert_topmost(self):
         """Pop the overlay back above the (topmost) taskbar — clicking the
         taskbar otherwise raises it over us. Skipped (and the overlay hidden)
-        while a fullscreen app is foreground, mirroring the taskbar's auto-hide.
-        A Z-only, non-activating change: cheap, no repaint, doesn't eat clicks."""
-        if self._foreground_is_fullscreen():
+        while a fullscreen app is foreground *on the badge's own monitor*,
+        mirroring the taskbar's auto-hide; a fullscreen app on another display
+        leaves us visible. A Z-only, non-activating change: cheap, no repaint,
+        doesn't eat clicks."""
+        if self._fullscreen_on_badge_monitor():
             if not self._hidden:
                 self.root.withdraw()
                 self._hidden = True
@@ -1098,9 +1228,15 @@ class UsageTray:
         self.stop = threading.Event()
         self.icon = None
         self.rate_limited_until = None   # epoch seconds; None when not limited
+        self.rate_limit_streak = 0       # consecutive 429s; drives backoff
         self.last_result = FetchResult("error")
         self._pending = None             # UpdateInfo when a newer release exists
         self.last_update_check = self.config.get("last_update_check")
+        self.debug = False               # set by run(); gates [poll] logging
+
+    def _log(self, msg):
+        if self.debug:
+            print(f"[poll] {msg}", flush=True)
 
     # -- polling --------------------------------------------------------------
     def poll_once(self):
@@ -1110,20 +1246,30 @@ class UsageTray:
         (a manual 'Refresh' otherwise just refreshes the rolling limit and
         keeps it from draining)."""
         if self.rate_limited_until and time.time() < self.rate_limited_until:
+            self._log(f"in cooldown until {fmt_clock(self.retry_at())}, "
+                      f"skipping fetch (streak={self.rate_limit_streak})")
             self.update_icon()
             return self.last_result
-        res = fetch_usage()
+        res = fetch_usage(log=self._log)
         self.last_result = res
         if res.kind == "ok":
             self.usage = res.usage
             self.stale = False
             self.rate_limited_until = None
+            self.rate_limit_streak = 0
             self.check_thresholds()
         elif res.kind == "rate_limited":
             self.stale = True          # keep last-known numbers, gray them out
-            self.rate_limited_until = time.time() + (res.retry_after or POLL_SECONDS)
+            self.rate_limit_streak += 1
+            wait = compute_next_wait(res, POLL_SECONDS, self.rate_limit_streak)
+            self.rate_limited_until = time.time() + wait
+            self._log(f"429 retry_after={res.retry_after} "
+                      f"streak={self.rate_limit_streak} backoff={wait}s "
+                      f"until {fmt_clock(self.retry_at())}")
         else:                          # auth / error
             self.stale = True
+        self._log(f"kind={res.kind} stale={self.stale} "
+                  f"usage={list((self.usage or {}).keys())}")
         self.update_icon()
         return res
 
@@ -1131,11 +1277,13 @@ class UsageTray:
         while not self.stop.is_set():
             try:
                 res = self.poll_once()
-                wait = compute_next_wait(res, POLL_SECONDS)
-            except Exception:
+                wait = compute_next_wait(res, POLL_SECONDS, self.rate_limit_streak)
+            except Exception as e:
                 self.stale = True
                 self.update_icon()
+                self._log(f"poll raised {e!r}; retrying in {POLL_SECONDS}s")
                 wait = POLL_SECONDS
+            self._log(f"sleeping {wait}s")
             self.stop.wait(wait)
 
     # -- self-update ------------------------------------------------------------
@@ -1301,6 +1449,12 @@ class UsageTray:
         self.config["taskbar"] = not self.config.get("taskbar", True)
         save_config(self.config)
 
+    def set_display(self, device):
+        """Persist which display the badge docks to (None = auto/primary).
+        reposition() reads this each tick, so it applies live."""
+        self.config["display"] = device
+        save_config(self.config)
+
     def build_icon(self):
         import pystray
         from pystray import Menu, MenuItem as Item
@@ -1333,6 +1487,23 @@ class UsageTray:
                      self.toggle_taskbar,
                      checked=lambda item: bool(self.config.get("taskbar", True))),
             ]
+            # "Show on display" — listed once at startup. Only displays with a
+            # taskbar can host the badge. Auto = follow the primary taskbar.
+            displays = enumerate_taskbar_displays()
+            if len(displays) > 1:
+                disp_items = [Item(
+                    "Auto (primary)", lambda: self.set_display(None),
+                    radio=True,
+                    checked=lambda item: not self.config.get("display"))]
+                for d in displays:
+                    dev = d["device"]
+                    disp_items.append(Item(
+                        d["label"],
+                        lambda dev=dev: self.set_display(dev),
+                        radio=True,
+                        checked=lambda item, dev=dev:
+                            self.config.get("display") == dev))
+                items.append(Item("Show on display", Menu(*disp_items)))
         items += [Menu.SEPARATOR, Item("Quit", self.quit)]
 
         self.icon = pystray.Icon(
@@ -1343,6 +1514,7 @@ class UsageTray:
         )
 
     def run(self, taskbar=False, debug=False):
+        self.debug = debug
         self.build_icon()
         threading.Thread(target=self.poll_loop, daemon=True).start()
         if getattr(sys, "frozen", False):
