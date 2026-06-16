@@ -179,6 +179,32 @@ class SelectTaskbar(unittest.TestCase):
         self.assertIsNone(cu.select_taskbar([], r"\\.\DISPLAY1"))
 
 
+class DisplaySetter(unittest.TestCase):
+    """Regression guard for the menu-callback arity bug: pystray keys off
+    co_argcount (counting default params), so a `lambda dev=dev:` is misread
+    as 1-arg and the icon is passed in as the device. The setter must be a
+    true 0-arg callable, and calling it must persist the device."""
+
+    def _app(self):
+        return cu.UsageTray(config={})
+
+    def test_setter_is_zero_arg(self):
+        cb = self._app()._make_display_setter(r"\\.\DISPLAY2")
+        self.assertEqual(cb.__code__.co_argcount, 0)
+
+    def test_calling_setter_persists_device(self):
+        orig = cu.save_config
+        cu.save_config = lambda cfg: None        # no disk write
+        try:
+            app = self._app()
+            app._make_display_setter(r"\\.\DISPLAY2")()
+            self.assertEqual(app.config["display"], r"\\.\DISPLAY2")
+            app._make_display_setter(None)()      # Auto clears it
+            self.assertIsNone(app.config["display"])
+        finally:
+            cu.save_config = orig
+
+
 class ComputeBadgeX(unittest.TestCase):
     def test_anchors_left_of_single_obstacle(self):
         # tray at relative-left 2345, badge 97 wide, 10px margin

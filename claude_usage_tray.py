@@ -1108,21 +1108,27 @@ class TaskbarBadge:
             fg = self.u32.GetForegroundWindow()
             if not fg or fg == self.hwnd:
                 return False
-            fg_mon = self.u32.MonitorFromWindow(fg, self.MONITOR_DEFAULTTONEAREST)
-            badge_mon = self.u32.MonitorFromWindow(
-                self._dock_hwnd or self.hwnd, self.MONITOR_DEFAULTTONEAREST)
-            if fg_mon != badge_mon:
-                return False           # fullscreen app is on a different display
             wr = self._rect(fg)
             if wr is None:
                 return False
+            fg_mon = self.u32.MonitorFromWindow(fg, self.MONITOR_DEFAULTTONEAREST)
             mi = self._MONITORINFO()
             mi.cbSize = ctypes.sizeof(self._MONITORINFO)
             if not self.u32.GetMonitorInfoW(fg_mon, ctypes.byref(mi)):
                 return False
             m = mi.rcMonitor
-            return is_fullscreen((wr.left, wr.top, wr.right, wr.bottom),
-                                 (m.left, m.top, m.right, m.bottom))
+            covers = is_fullscreen((wr.left, wr.top, wr.right, wr.bottom),
+                                   (m.left, m.top, m.right, m.bottom))
+            if not covers:
+                return False           # not a fullscreen window — nothing to do
+            # It IS fullscreen; hide only if it's on the badge's own monitor.
+            badge_mon = self.u32.MonitorFromWindow(
+                self._dock_hwnd or self.hwnd, self.MONITOR_DEFAULTTONEAREST)
+            same = fg_mon == badge_mon
+            self.log(f"fullscreen fg={fg} fg_mon={fg_mon} badge_mon={badge_mon} "
+                     f"dock={self._dock_hwnd} same_monitor={same} -> "
+                     f"{'hide' if same else 'keep'}")
+            return same
         except Exception:
             return False
 
@@ -1455,6 +1461,16 @@ class UsageTray:
         self.config["display"] = device
         save_config(self.config)
 
+    def _make_display_setter(self, device):
+        """Return a genuinely 0-arg callback that selects `device`.
+
+        pystray's _assert_action keys off co_argcount, which counts
+        default-valued params too — so an inline `lambda dev=dev: ...` is
+        misread as a 1-arg action and gets the Icon passed in as `dev`
+        (set_display then stores an unserializable Icon and the choice is
+        silently dropped). A factory closure is a true 0-arg callable."""
+        return lambda: self.set_display(device)
+
     def build_icon(self):
         import pystray
         from pystray import Menu, MenuItem as Item
@@ -1492,14 +1508,14 @@ class UsageTray:
             displays = enumerate_taskbar_displays()
             if len(displays) > 1:
                 disp_items = [Item(
-                    "Auto (primary)", lambda: self.set_display(None),
+                    "Auto (primary)", self._make_display_setter(None),
                     radio=True,
                     checked=lambda item: not self.config.get("display"))]
                 for d in displays:
                     dev = d["device"]
                     disp_items.append(Item(
                         d["label"],
-                        lambda dev=dev: self.set_display(dev),
+                        self._make_display_setter(dev),
                         radio=True,
                         checked=lambda item, dev=dev:
                             self.config.get("display") == dev))
