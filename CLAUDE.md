@@ -23,8 +23,9 @@ python claude_usage_tray.py --debug
 # Force taskbar text mode on and persist it to config
 python claude_usage_tray.py --taskbar
 
-# Install deps for local dev (tkinter ships with Python); release.yml pins the versions CI ships
-pip install pystray pillow requests comtypes
+# Install deps for local dev (tkinter ships with Python). requirements-build.txt pins every
+# package CI ships, transitive ones too; regenerate it with pip freeze in a clean 3.12 venv.
+pip install -r requirements-build.txt
 
 # Run the unit tests (stdlib unittest, no display/network needed)
 python -m unittest -v test_claude_usage
@@ -95,14 +96,16 @@ tick but doesn't own it.
   lock (`~/.claude/.oauth_refresh.lock`) and, when a refresh token comes back rejected,
   **wipes the saved login**. So a second refresher that wins a race can sign the user out
   of Claude Code. (The old refresh also posted to `console.anthropic.com/v1/oauth/token`,
-  which now 404s; Claude Code uses `platform.claude.com`.) A missing token, one past
-  `expiresAt`, or a 401 is `auth`: no request when the token is known dead, and the tooltip
-  says "Signed out: open Claude Code to sign in". The next poll picks up whatever Claude Code
-  renewed. A missing credentials file isn't fatal: the app starts gray.
+  which now 404s; Claude Code uses `platform.claude.com`.) A missing token or one past
+  `expiresAt` is `signed_out`: no request is made, it doesn't count against `MIN_FETCH_GAP`,
+  and `poll_loop` re-reads the file every `SIGNIN_RECHECK` (30s) so the badge recovers soon
+  after Claude Code signs back in. A 401 is `auth` and keeps the 300s pace. Either way the
+  tooltip says "Signed out: open Claude Code to sign in". A missing credentials file isn't
+  fatal: the app starts gray.
 - **This endpoint rate-limits aggressively and account-wide.** It's meant to be hit
   on-demand (Claude Code's `/usage`), not polled. `POLL_SECONDS` is therefore **300**, not
-  60 — do not lower it. `fetch_usage()` returns a `FetchResult` (`ok` / `auth` /
-  `rate_limited` / `error`), not a bare dict/None. On a 429, `poll_once` honors the
+  60 — do not lower it. `fetch_usage()` returns a `FetchResult` (`ok` / `signed_out` /
+  `auth` / `rate_limited` / `error`), not a bare dict/None. On a 429, `poll_once` honors the
   server's `Retry-After` and, via `compute_next_wait`, **backs off exponentially on
   consecutive 429s** (`rate_limit_streak`: 300s → 600 → 1200 … capped at 1h) so the rolling
   limit can actually drain; retrying flat every 300s keeps re-tripping an account-wide
@@ -129,8 +132,11 @@ tick but doesn't own it.
   must stay as-is — the usage endpoint depends on it; GitHub uses `GITHUB_UA`.
 - Flow: `update_loop` → `fetch_latest_release()` (reads `releases/latest`, public repo, no
   auth) → `select_release_assets` → `is_newer_version` → arm `self._pending`, toast, and a
-  dynamic tray item "Update to vX.Y.Z & restart". On click, `apply_update()` downloads the
-  exe + its `.sha256` sidecar, **verifies SHA-256 before touching anything**, then swaps.
+  dynamic tray item "Update to vX.Y.Z and restart". On click, `start_update` (one at a time,
+  `_update_lock`, so a double-click can't race two downloads) runs `apply_update()`, which
+  toasts "Downloading…", downloads the exe + its `.sha256` sidecar, **verifies SHA-256
+  before touching anything**, then swaps. "Check for updates now" passes `manual=True`, so it
+  always answers with a toast (update available / up to date / couldn't reach GitHub).
 - The swap is the only delicate part (a running `--onefile` exe can't be overwritten, only
   renamed): rename `ClaudeUsage.exe`→`.old.exe`, `os.replace` the verified `.new.exe`→
   `ClaudeUsage.exe` (with rollback if that fails), relaunch with `--updated`, then quit to
@@ -236,6 +242,7 @@ the display choice applies live (`reposition` reads it each tick).
   text (`TEXT_PALETTE`, hex).
 - Threshold toasts (80/95%) fire once per 5h window, keyed on `resets_at` truncated to the
   minute: the API adds per-request microseconds, so the raw value changes on every poll.
+  Only the highest threshold crossed toasts (a first poll at 96% gives one toast, not two).
 - Lazy imports inside methods (`PIL`, `tkinter`, `pystray`, `winreg`, `ctypes`) keep the
   pure-function layer importable without a display or Windows.
 - Tray menu text goes straight into a Win32 menu, which eats a lone `&` as a shortcut-key

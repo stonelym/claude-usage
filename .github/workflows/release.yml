@@ -19,9 +19,9 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Pinned: every build reaches all installs via self-update, so bump on purpose.
+      # Every package pinned, transitive ones too: each build reaches all installs.
       - name: Install dependencies
-        run: python -m pip install pyinstaller==6.20.0 pystray==0.19.5 pillow==12.2.0 requests==2.34.2 comtypes==1.4.17
+        run: python -m pip install -r requirements-build.txt
 
       - name: Unit tests (gate)
         run: python -m unittest -v test_claude_usage

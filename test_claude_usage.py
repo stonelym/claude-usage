@@ -402,6 +402,21 @@ class CheckForUpdate(unittest.TestCase):
         self.assertTrue(cu.should_check_for_update(
             time.time(), app.last_update_check, cu.UPDATE_INTERVAL))
 
+    def manual_check(self, release):
+        app = cu.UsageTray(config={})
+        app.icon = mock.Mock()
+        with mock.patch.object(cu, "fetch_latest_release", lambda: release), \
+                mock.patch.object(cu, "save_config", lambda cfg: None):
+            app.check_for_update(manual=True)
+        return app.icon.notify.call_args.args[0]
+
+    def test_manual_check_answers_when_up_to_date(self):
+        same = cu.UpdateInfo(f"v{cu.VERSION}", "exe-url", "sha-url")
+        self.assertIn("latest version", self.manual_check(same))
+
+    def test_manual_check_answers_when_offline(self):
+        self.assertIn("Couldn't reach GitHub", self.manual_check(None))
+
 
 # ---------------------------------------------------------------------------
 # Self-update: the exe swap (network faked, real file moves in a temp dir)
@@ -461,6 +476,13 @@ class ApplyUpdate(unittest.TestCase):
         self.app.apply_update()
         self.assertEqual(self.installed(), b"OLD")
         self.app.quit.assert_not_called()
+
+    def test_second_click_while_updating_is_ignored(self):
+        # Two downloads into the same files report a false failure.
+        self.app._update_lock.acquire()          # first click still downloading
+        self.app.apply_update = mock.Mock()
+        self.app.start_update()
+        self.app.apply_update.assert_not_called()
 
 
 class Relaunch(unittest.TestCase):
@@ -538,6 +560,18 @@ class PollOnce(unittest.TestCase):
         self.app.poll_loop()
         self.assertEqual(waits, [100])
 
+    def test_signed_out_rechecks_soon_and_never_blocks_a_refresh(self):
+        # Right after Claude Code signs back in, a click must fetch.
+        self.poll(cu.FetchResult("signed_out"))
+        self.poll(self.OK, after=5)
+        self.assertEqual((self.fetches, self.app.stale), (2, False))
+        self.app.last_result = cu.FetchResult("signed_out")
+        waits = []
+        self.app.stop = mock.Mock(is_set=lambda: bool(waits), wait=waits.append)
+        self.app.poll_once = lambda: None
+        self.app.poll_loop()
+        self.assertEqual(waits, [cu.SIGNIN_RECHECK])
+
 
 class ThresholdToasts(unittest.TestCase):
     def test_once_per_window_despite_changing_microseconds(self):
@@ -549,6 +583,15 @@ class ThresholdToasts(unittest.TestCase):
                 "utilization": 85, "resets_at": f"2026-10-17T{stamp}+00:00"}})
             app.check_thresholds()
         self.assertEqual(app.icon.notify.call_count, 2)   # 06:20 window, 11:20 window
+
+    def test_first_poll_past_both_thresholds_toasts_once(self):
+        app = cu.UsageTray(config={})
+        app.icon = mock.Mock()
+        app.usage = cu.parse_usage({"five_hour": {"utilization": 96,
+                                                  "resets_at": None}})
+        app.check_thresholds()
+        app.check_thresholds()
+        self.assertEqual(app.icon.notify.call_count, 1)
 
 
 class FetchUsage(unittest.TestCase):
@@ -583,11 +626,11 @@ class FetchUsage(unittest.TestCase):
         # Spares the rate-limited endpoint a guaranteed 401.
         res, gets = self.fetch({"accessToken": "a1",
                                 "expiresAt": (time.time() - 60) * 1000})
-        self.assertEqual((res.kind, gets), ("auth", 0))
+        self.assertEqual((res.kind, gets), ("signed_out", 0))
 
-    def test_token_wiped_by_claude_code_is_auth(self):
+    def test_token_wiped_by_claude_code_is_signed_out(self):
         res, gets = self.fetch({"accessToken": "", "expiresAt": 0})
-        self.assertEqual((res.kind, gets), ("auth", 0))
+        self.assertEqual((res.kind, gets), ("signed_out", 0))
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ import requests
 VERSION = "1.0.8"  # single source of truth; release.ps1/CI tag releases from this
 POLL_SECONDS = 300
 MIN_FETCH_GAP = 60   # a click/Refresh never fetches sooner than this after the last fetch
+SIGNIN_RECHECK = 30  # signed out: re-read the token file this often (no request is made)
 APP_NAME = "ClaudeUsage"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
@@ -208,9 +209,11 @@ def pick_color(pct, stale: bool, palette):
 # ----------------------------------------------------------------------------
 # Fetch result classification (pure — unit-testable without network)
 # ----------------------------------------------------------------------------
-# Outcome of one usage fetch. kind: "ok" | "auth" | "rate_limited" | "error"
+# Outcome of one usage fetch.
+# kind: "ok" | "signed_out" | "auth" | "rate_limited" | "error"
 #   ok           -> .usage holds the parsed window dict
-#   auth         -> 401 or no usable token; Claude Code must renew it
+#   signed_out   -> token missing or expired; no request was made
+#   auth         -> 401; Claude Code must renew the token
 #   rate_limited -> 429; .retry_after holds the server's backoff seconds
 #   error        -> anything else (network, 5xx, bad body); keep last data
 FetchResult = namedtuple("FetchResult", "kind usage retry_after",
@@ -486,8 +489,8 @@ def fetch_usage(log=None) -> FetchResult:
     We never renew the token. Claude Code refreshes it under its own lock
     (~/.claude/.oauth_refresh.lock) and wipes the saved login when a refresh
     token comes back rejected, so a second refresher that wins a race can sign
-    the user out. A missing or expired token is "auth" without a request; the
-    next poll picks up whatever Claude Code renewed. A 429 returns
+    the user out. A missing or expired token is "signed_out" without a
+    request; the next poll picks up whatever Claude Code renewed. A 429 returns
     "rate_limited" with the server's Retry-After; anything else that isn't a
     clean 200 is "error" (keep last-known numbers, gray them out). `log` is an
     optional callable (str)->None for --debug diagnostics.
@@ -498,12 +501,12 @@ def fetch_usage(log=None) -> FetchResult:
     oauth = (read_credentials() or {}).get("claudeAiOauth") or {}
     token = oauth.get("accessToken")
     if not token:
-        _emit("no access token in credentials -> auth")
-        return FetchResult("auth")
+        _emit("no access token in credentials -> signed_out")
+        return FetchResult("signed_out")
     expires = oauth.get("expiresAt")   # epoch ms
     if isinstance(expires, (int, float)) and expires <= time.time() * 1000:
-        _emit("access token expired; waiting for Claude Code to renew -> auth")
-        return FetchResult("auth")
+        _emit("access token expired; waiting for Claude Code to renew -> signed_out")
+        return FetchResult("signed_out")
     try:
         r = requests.get(
             USAGE_URL,
@@ -1146,6 +1149,7 @@ class UsageTray:
         self.rate_limit_streak = 0       # consecutive 429s; drives backoff
         self._last_fetch = 0.0           # epoch of the last real fetch (MIN_FETCH_GAP)
         self._poll_lock = threading.Lock()  # one fetch at a time: loop vs clicks
+        self._update_lock = threading.Lock()  # one self-update at a time
         self.last_result = FetchResult("error")
         self._pending = None             # UpdateInfo when a newer release exists
         self.last_update_check = self.config.get("last_update_check")
@@ -1179,6 +1183,8 @@ class UsageTray:
             self._last_fetch = now
             res = fetch_usage(log=self._log)
             self.last_result = res
+            if res.kind == "signed_out":
+                self._last_fetch = 0.0     # no request was made; don't hold back a Refresh
             if res.kind == "ok":
                 self.usage = res.usage
                 self.stale = False
@@ -1193,7 +1199,7 @@ class UsageTray:
                 self._log(f"429 retry_after={res.retry_after} "
                           f"streak={self.rate_limit_streak} backoff={wait}s "
                           f"until {fmt_clock(self.retry_at())}")
-            else:                          # auth / error
+            else:                          # signed_out / auth / error
                 self.stale = True
             self._log(f"kind={res.kind} stale={self.stale} "
                       f"usage={list((self.usage or {}).keys())}")
@@ -1207,8 +1213,11 @@ class UsageTray:
             try:
                 self.poll_once()
                 # Sleep out any cooldown (a manual refresh may have set it
-                # mid-interval) instead of restarting a full backoff.
+                # mid-interval) instead of restarting a full backoff. Signed
+                # out, re-check the token file soon so the badge recovers
+                # right after Claude Code signs back in.
                 wait = (self.rate_limited_until - time.time() if self.retry_at()
+                        else SIGNIN_RECHECK if self.last_result.kind == "signed_out"
                         else POLL_SECONDS)
             except Exception as e:
                 self.stale = True
@@ -1234,12 +1243,16 @@ class UsageTray:
             if self.stop.wait(3600):     # wake hourly; the gate throttles to daily
                 return
 
-    def check_for_update(self):
+    def check_for_update(self, manual=False):
         """Fetch latest release; if newer, arm the tray item + toast once.
         A failed fetch (e.g. offline at login) isn't stamped, so the hourly
-        wake in update_loop retries it instead of waiting a day."""
+        wake in update_loop retries it instead of waiting a day. `manual` (the
+        menu item) always answers with a toast, even when there's no update."""
         info = fetch_latest_release()
         if not info:
+            if manual and self.icon:
+                self.icon.notify("Couldn't reach GitHub to check for updates.",
+                                 "ClaudeUsage")
             return
         self.last_update_check = time.time()
         self.config["last_update_check"] = self.last_update_check
@@ -1248,14 +1261,27 @@ class UsageTray:
             already = self._pending is not None and self._pending.tag == info.tag
             self._pending = info
             if self.icon:
-                if not already:
+                if manual or not already:
                     self.icon.notify(
                         f"ClaudeUsage {info.tag} is available — open the menu "
                         f"to update.", "Update available")
                 self.icon.update_menu()
+        elif manual and self.icon:
+            self.icon.notify(f"You're on the latest version (v{VERSION}).",
+                             "ClaudeUsage")
 
     def start_update(self):
-        threading.Thread(target=self.apply_update, daemon=True).start()
+        # One update at a time: a second click mid-download would race the
+        # first over the same files and report a false failure.
+        if not self._update_lock.acquire(blocking=False):
+            return
+
+        def run():
+            try:
+                self.apply_update()
+            finally:
+                self._update_lock.release()
+        threading.Thread(target=run, daemon=True).start()
 
     def apply_update(self):
         """Download, verify (SHA-256), swap the running exe, and relaunch.
@@ -1271,6 +1297,8 @@ class UsageTray:
         canonical = os.path.join(install_dir, ASSET_EXE)
         old = os.path.join(install_dir, "ClaudeUsage.old.exe")
         new = os.path.join(install_dir, "ClaudeUsage.new.exe")
+        if self.icon:
+            self.icon.notify(f"Downloading {info.tag}...", "ClaudeUsage")
 
         # 1. Download + verify BEFORE touching the installed exe.
         if not download_to(info.exe_url, new):
@@ -1366,15 +1394,17 @@ class UsageTray:
         if key != self.window_key:     # new 5h window -> re-arm toasts
             self.window_key = key
             self.notified.clear()
-        for t in NOTIFY_THRESHOLDS:
-            if fh["utilization"] >= t and t not in self.notified:
-                self.notified.add(t)
-                if self.icon:
-                    self.icon.notify(
-                        f"Session usage at {fh['utilization']:.0f}% "
-                        f"(resets {fmt_clock(fh['resets_at'])})",
-                        "Claude usage",
-                    )
+        # One toast for the highest threshold crossed, not one per threshold
+        # (a first poll at 96% would otherwise fire 80% and 95% together).
+        crossed = [t for t in NOTIFY_THRESHOLDS if fh["utilization"] >= t]
+        if crossed and crossed[-1] not in self.notified:
+            self.notified.update(crossed)
+            if self.icon:
+                self.icon.notify(
+                    f"Session usage at {fh['utilization']:.0f}% "
+                    f"(resets {fmt_clock(fh['resets_at'])})",
+                    "Claude usage",
+                )
 
     # -- UI ---------------------------------------------------------------------
     def retry_at(self):
@@ -1385,7 +1415,7 @@ class UsageTray:
 
     def tooltip_text(self):
         return build_tooltip(self.usage, self.stale, self.retry_at(),
-                             signed_out=self.last_result.kind == "auth")
+                             signed_out=self.last_result.kind in ("signed_out", "auth"))
 
     def update_icon(self):
         if not self.icon:
@@ -1441,7 +1471,7 @@ class UsageTray:
         ]
         if frozen:
             items.append(Item("Check for updates now", lambda: threading.Thread(
-                target=self.check_for_update, daemon=True).start()))
+                target=self.check_for_update, args=(True,), daemon=True).start()))
         if sys.platform == "win32":
             items += [
                 Menu.SEPARATOR,

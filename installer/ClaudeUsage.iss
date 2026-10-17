@@ -50,8 +50,10 @@ Filename: "{app}\ClaudeUsage.exe"; Description: "Launch ClaudeUsage"; \
     Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; Remove the install dir incl. any self-update leftovers (.old/.new exe).
+; Remove the install dir incl. any self-update leftovers (.old/.new exe), and
+; the app's config + comtypes wrapper cache.
 Type: filesandordirs; Name: "{app}"
+Type: filesandordirs; Name: "{userappdata}\ClaudeUsage"
 
 [Code]
 // Close a running instance so its locked exe can be replaced (install/upgrade).

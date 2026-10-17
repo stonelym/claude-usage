@@ -1,0 +1,18 @@
+# Every package in the CI build, transitive ones included (pip freeze, Python 3.12).
+# Each build reaches all installs via self-update, so change these on purpose.
+altgraph==0.17.5
+certifi==2026.7.22
+charset-normalizer==3.5.2
+comtypes==1.4.17
+idna==3.20
+packaging==26.3
+pefile==2024.8.26
+pillow==12.2.0
+pyinstaller==6.20.0
+pyinstaller-hooks-contrib==2026.8
+pystray==0.19.5
+pywin32-ctypes==0.2.3
+requests==2.34.2
+setuptools==84.0.0
+six==1.17.0
+urllib3==2.8.0
