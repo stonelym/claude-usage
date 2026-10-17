@@ -63,3 +63,19 @@ begin
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
 end;
+
+// Uninstall: close the running app so its exe can be deleted, and remove the
+// Run value even when startup was turned on from the tray menu (the [Registry]
+// entry above only covers the installer's own startup task).
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im ClaudeUsage.exe', '',
+         SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    RegDeleteValue(HKEY_CURRENT_USER,
+                   'Software\Microsoft\Windows\CurrentVersion\Run', 'ClaudeUsage');
+  end;
+end;

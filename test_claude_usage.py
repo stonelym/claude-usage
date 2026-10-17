@@ -2,7 +2,14 @@
 
 Run:  python -m unittest -v test_claude_usage
 """
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+import time
 import unittest
+from unittest import mock
 
 import claude_usage_tray as cu
 
@@ -121,17 +128,6 @@ class TooltipRateLimited(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Bug 2: collision-aware taskbar badge positioning
 # ---------------------------------------------------------------------------
-class ShouldMove(unittest.TestCase):
-    def test_no_move_when_geometry_unchanged(self):
-        self.assertFalse(cu.should_move((100, 10, 97, 23), (100, 10, 97, 23)))
-
-    def test_move_when_changed(self):
-        self.assertTrue(cu.should_move((100, 10, 97, 23), (90, 10, 97, 23)))
-
-    def test_move_on_first_call_no_prev(self):
-        self.assertTrue(cu.should_move(None, (100, 10, 97, 23)))
-
-
 class IsFullscreen(unittest.TestCase):
     MON = (0, 0, 2560, 1440)
 
@@ -152,6 +148,12 @@ class IsFullscreen(unittest.TestCase):
     def test_fullscreen_on_secondary_monitor(self):
         mon = (2560, 0, 5120, 1440)
         self.assertTrue(cu.is_fullscreen((2560, 0, 5120, 1440), mon))
+
+    def test_desktop_is_not_fullscreen(self):
+        # A desktop click / Win+D makes Progman foreground; it covers the
+        # monitor exactly, and used to hide the badge.
+        self.assertFalse(cu.is_fullscreen(self.MON, self.MON, "Progman"))
+        self.assertFalse(cu.is_fullscreen(self.MON, self.MON, "WorkerW"))
 
 
 class SelectTaskbar(unittest.TestCase):
@@ -207,25 +209,29 @@ class DisplaySetter(unittest.TestCase):
 
 class ComputeBadgeX(unittest.TestCase):
     def test_anchors_left_of_single_obstacle(self):
-        # tray at relative-left 2345, badge 97 wide, 10px margin
+        # tray at left 2345, badge 97 wide, 10px margin
         self.assertEqual(
-            cu.compute_badge_x([2345], badge_w=97, margin=10), 2345 - 97 - 10)
+            cu.compute_badge_x([2345], badge_w=97, margin=10, floor=0),
+            2345 - 97 - 10)
 
     def test_dodges_widget_left_of_tray(self):
         # Regression for the reported bug: a right-docked Widgets button
-        # (rel-left 2181) sits left of the tray (rel-left 2345). The badge
-        # must clear the WIDGET, not just the tray.
-        x = cu.compute_badge_x([2345, 2181], badge_w=97, margin=10)
+        # (left 2181) sits left of the tray (left 2345). The badge must clear
+        # the WIDGET, not just the tray.
+        x = cu.compute_badge_x([2345, 2181], badge_w=97, margin=10, floor=0)
         self.assertEqual(x, 2181 - 97 - 10)
         self.assertLess(x + 97, 2181)  # badge ends before the widget begins
 
-    def test_clamps_to_zero(self):
-        self.assertEqual(cu.compute_badge_x([50], badge_w=97, margin=10), 0)
-
-    def test_empty_obstacles_uses_fallback(self):
+    def test_clamps_to_taskbar_left(self):
         self.assertEqual(
-            cu.compute_badge_x([], badge_w=97, margin=10, fallback_left=1000),
-            1000 - 97 - 10)
+            cu.compute_badge_x([50], badge_w=97, margin=10, floor=0), 0)
+
+    def test_monitor_left_of_primary_keeps_negative_x(self):
+        # Secondary taskbar spans x -1920..0; its fallback anchor is -250.
+        # Clamping to 0 used to throw the badge onto the primary monitor.
+        self.assertEqual(
+            cu.compute_badge_x([-250], badge_w=300, margin=10, floor=-1920),
+            -560)
 
 
 class SafeWarn(unittest.TestCase):
@@ -376,6 +382,170 @@ class ShouldCheckForUpdate(unittest.TestCase):
 
     def test_true_when_never_checked(self):
         self.assertTrue(cu.should_check_for_update(now=1000, last_check=None, interval_s=600))
+
+
+class CheckForUpdate(unittest.TestCase):
+    def test_failed_fetch_is_retried_not_pushed_a_day_out(self):
+        app = cu.UsageTray(config={})
+        with mock.patch.object(cu, "fetch_latest_release", lambda: None), \
+                mock.patch.object(cu, "save_config", lambda cfg: None):
+            app.check_for_update()            # offline at login
+        self.assertTrue(cu.should_check_for_update(
+            time.time(), app.last_update_check, cu.UPDATE_INTERVAL))
+
+
+# ---------------------------------------------------------------------------
+# Self-update: the exe swap (network faked, real file moves in a temp dir)
+# ---------------------------------------------------------------------------
+class ApplyUpdate(unittest.TestCase):
+    """The swap is the one step that can leave the install with no exe."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.exe = os.path.join(self.dir, "ClaudeUsage.exe")
+        with open(self.exe, "wb") as f:
+            f.write(b"OLD")
+
+        def download(url, dest):
+            with open(dest, "wb") as f:
+                f.write(b"NEW")
+            return True
+        for target, attr, value in ((cu.sys, "frozen", True),
+                                    (cu.sys, "executable", self.exe),
+                                    (cu, "download_to", download)):
+            p = mock.patch.object(target, attr, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+        self.app = cu.UsageTray(config={})
+        self.app._pending = cu.UpdateInfo("v9.9.9", "exe-url", "sha-url")
+        self.app._fetch_sidecar_hash = lambda url: hashlib.sha256(b"NEW").hexdigest()
+        self.app._relaunch = mock.Mock()
+        self.app.quit = mock.Mock()
+
+    def installed(self):
+        with open(self.exe, "rb") as f:
+            return f.read()
+
+    def test_swaps_in_verified_build_and_relaunches(self):
+        self.app.apply_update()
+        self.assertEqual(self.installed(), b"NEW")
+        self.app._relaunch.assert_called_once()
+
+    def test_bad_hash_leaves_install_untouched(self):
+        self.app._fetch_sidecar_hash = lambda url: "0" * 64
+        self.app.apply_update()
+        self.assertEqual(self.installed(), b"OLD")
+        self.app._relaunch.assert_not_called()
+
+    def test_failed_install_rolls_back(self):
+        real = self.app._move_retry
+        self.app._move_retry = lambda src, dst, replace: (
+            False if src.endswith(".new.exe") else real(src, dst, replace, tries=1))
+        self.app.apply_update()
+        self.assertEqual(self.installed(), b"OLD")
+        self.app._relaunch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Poll state machine (fetch_usage and the clock faked; no network)
+# ---------------------------------------------------------------------------
+class PollOnce(unittest.TestCase):
+    OK = cu.FetchResult("ok", usage={})
+    LIMITED = cu.FetchResult("rate_limited")
+
+    def setUp(self):
+        self.now = 1_790_000_000.0
+        self.replies, self.fetches = [], 0
+
+        def fake_fetch(log=None):
+            self.fetches += 1
+            return self.replies.pop(0)
+        for target, attr, value in ((cu, "fetch_usage", fake_fetch),
+                                    (cu.time, "time", lambda: self.now)):
+            p = mock.patch.object(target, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.app = cu.UsageTray(config={})
+
+    def poll(self, reply=None, after=0):
+        self.now += after
+        if reply:
+            self.replies.append(reply)
+        return self.app.poll_once()
+
+    def test_429s_back_off_then_ok_resets(self):
+        self.poll(self.LIMITED)
+        self.assertEqual(self.app.rate_limited_until - self.now, 300)
+        self.poll(self.LIMITED, after=300)
+        self.assertEqual(self.app.rate_limited_until - self.now, 600)
+        self.poll(self.OK, after=600)
+        self.assertEqual((self.app.rate_limit_streak, self.app.rate_limited_until,
+                          self.app.stale), (0, None, False))
+
+    def test_no_fetch_inside_cooldown(self):
+        self.poll(self.LIMITED)
+        self.poll(after=120)              # past the click gap, still cooling down
+        self.assertEqual(self.fetches, 1)
+
+    def test_rapid_clicks_fetch_once(self):
+        self.poll(self.OK)
+        for _ in range(4):
+            self.poll(after=5)
+        self.assertEqual(self.fetches, 1)
+
+    def test_fetch_in_flight_is_not_doubled(self):
+        self.app._poll_lock.acquire()     # another thread is mid-fetch
+        self.poll(self.OK)
+        self.assertEqual(self.fetches, 0)
+
+    def test_loop_sleeps_out_remaining_cooldown(self):
+        # A manual refresh set the cooldown mid-interval: the loop must wake
+        # when it ends, not restart a full backoff from now.
+        self.app.rate_limited_until = self.now + 100
+        waits = []
+        self.app.stop = mock.Mock(is_set=lambda: bool(waits), wait=waits.append)
+        self.app.poll_loop()
+        self.assertEqual(waits, [100])
+
+
+class ThresholdToasts(unittest.TestCase):
+    def test_once_per_window_despite_changing_microseconds(self):
+        # The live API returns resets_at with per-request microseconds.
+        app = cu.UsageTray(config={})
+        app.icon = mock.Mock()
+        for stamp in ("06:20:00.253081", "06:20:00.439678", "11:20:00.120000"):
+            app.usage = cu.parse_usage({"five_hour": {
+                "utilization": 85, "resets_at": f"2026-10-17T{stamp}+00:00"}})
+            app.check_thresholds()
+        self.assertEqual(app.icon.notify.call_count, 2)   # 06:20 window, 11:20 window
+
+
+class RefreshToken(unittest.TestCase):
+    def test_keeps_entries_claude_code_saved_meanwhile(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        path = os.path.join(d, ".credentials.json")
+        with open(path, "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "a1", "refreshToken": "r1"},
+                       "mcpOAuth": {}}, f)
+
+        def post(*a, **k):
+            # Claude Code saves an MCP login while our refresh is in flight.
+            with open(path) as f:
+                creds = json.load(f)
+            creds["mcpOAuth"]["github"] = {"token": "x"}
+            with open(path, "w") as f:
+                json.dump(creds, f)
+            return mock.Mock(status_code=200, json=lambda: {
+                "access_token": "a2", "refresh_token": "r2"})
+        with mock.patch.object(cu, "CRED_PATH", path), \
+                mock.patch.object(cu.requests, "post", post):
+            self.assertEqual(cu.refresh_token(), "a2")
+        with open(path) as f:
+            creds = json.load(f)
+        self.assertEqual(creds["mcpOAuth"], {"github": {"token": "x"}})
+        self.assertEqual(creds["claudeAiOauth"]["refreshToken"], "r2")
 
 
 if __name__ == "__main__":

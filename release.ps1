@@ -25,5 +25,11 @@ if (git tag --list $tag) {
 
 git tag $tag
 git push origin $tag
+# $ErrorActionPreference doesn't stop on a failing native command in PowerShell 5.1.
+if ($LASTEXITCODE) {
+    git tag -d $tag | Out-Null
+    Write-Host "Push failed; removed local tag $tag. Fix the problem and rerun." -ForegroundColor Red
+    exit 1
+}
 Write-Host "Pushed $tag. GitHub Actions will build the exe + installer and publish the release:" -ForegroundColor Green
 Write-Host "  https://github.com/stonelym/claude-usage/actions"

@@ -13,5 +13,8 @@ comtypes_gen/
 # Local Claude Code settings
 .claude/
 
+# claude-mem context notes it writes into subfolders (the root CLAUDE.md is real docs)
+*/**/CLAUDE.md
+
 # Local planning notes
 plan-*.md

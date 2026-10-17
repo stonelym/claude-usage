@@ -23,7 +23,7 @@ python claude_usage_tray.py --debug
 # Force taskbar text mode on and persist it to config
 python claude_usage_tray.py --taskbar
 
-# Install deps manually for local dev (tkinter ships with Python)
+# Install deps for local dev (tkinter ships with Python); release.yml pins the versions CI ships
 pip install pystray pillow requests comtypes
 
 # Run the unit tests (stdlib unittest, no display/network needed)
@@ -45,12 +45,14 @@ Inno Setup installer (`installer/ClaudeUsage.iss`) is **per-user** — installs 
 app self-updates in, so updates stay unprivileged. It optionally adds the HKCU `Run` startup
 entry (the same value the tray toggle uses) and a Start Menu shortcut.
 
-Tests live in `test_claude_usage.py` (stdlib `unittest`, no extra deps). They cover the
-display-free logic: usage parsing, 429/Retry-After classification, poll-backoff math, the
-single-instance guard, badge-position math (`compute_badge_x`/`should_move`/`is_fullscreen`/
-`select_taskbar`),
-and the self-update helpers (`parse_version`/`is_newer_version`/`select_release_assets`/
-`parse_sha256_sidecar`/`verify_sha256`). The pure functions are deliberately importable
+Tests live in `test_claude_usage.py` (stdlib `unittest` + `unittest.mock`, no extra deps). They
+cover the display-free logic: usage parsing, 429/Retry-After classification, poll-backoff math,
+the `poll_once`/`poll_loop` state machine (cooldown skip, click gap, in-flight lock; with
+`fetch_usage` and the clock faked), threshold toasts, the credentials write-back, the
+single-instance guard, badge-position math (`compute_badge_x`/`is_fullscreen`/`select_taskbar`),
+the self-update helpers (`parse_version`/`is_newer_version`/`select_release_assets`/
+`parse_sha256_sidecar`/`verify_sha256`), and the `apply_update` swap/rollback in a temp dir.
+The pure functions are deliberately importable
 without a display — but the module does a top-level `import requests`, so `requests` must be
 installed to import it at all.
 
@@ -88,17 +90,23 @@ tick but doesn't own it.
   oauth-2025-04-20` header and a `claude-code/...` User-Agent.
 - On a 401 it does **one** refresh via the Claude Code OAuth flow and **writes the new
   tokens back** to `.credentials.json` (atomic temp-file + `os.replace`) so Claude Code
-  stays in sync. This file is shared state with Claude Code — treat writes carefully.
+  stays in sync. This file is shared state with Claude Code — treat writes carefully: the
+  refresh re-reads it just before writing and replaces only `claudeAiOauth`, so entries
+  Claude Code saved meanwhile (e.g. `mcpOAuth` MCP logins) survive. A missing credentials
+  file isn't fatal: the app starts gray and picks up a login on the next poll.
 - **This endpoint rate-limits aggressively and account-wide.** It's meant to be hit
   on-demand (Claude Code's `/usage`), not polled. `POLL_SECONDS` is therefore **300**, not
   60 — do not lower it. `fetch_usage()` returns a `FetchResult` (`ok` / `auth` /
-  `rate_limited` / `error`), not a bare dict/None. On a 429, `poll_loop` honors the
+  `rate_limited` / `error`), not a bare dict/None. On a 429, `poll_once` honors the
   server's `Retry-After` and, via `compute_next_wait`, **backs off exponentially on
   consecutive 429s** (`rate_limit_streak`: 300s → 600 → 1200 … capped at 1h) so the rolling
   limit can actually drain; retrying flat every 300s keeps re-tripping an account-wide
   window that needs longer than that to clear (the "constantly stale" failure mode).
-  `poll_once` also refuses to hit the endpoint while still inside a cooldown (so a manual
-  "Refresh" can't re-arm it); `--debug` emits `[poll]` lines (HTTP status, kind, streak,
+  `poll_loop` sleeps until exactly `rate_limited_until` (a manual refresh can set it
+  mid-interval). `poll_once` also refuses to hit the endpoint while still inside a cooldown
+  (so a manual "Refresh" can't re-arm it), while another fetch is in flight (`_poll_lock`),
+  or within `MIN_FETCH_GAP` (60s) of the last fetch, so repeated clicks on the badge or
+  "Refresh" can't hammer it; `--debug` emits `[poll]` lines (HTTP status, kind, streak,
   backoff) so a stuck-stale state is diagnosable on the live machine.
   The rate-limited state is surfaced in the tooltip ("Rate-limited, retry HH:MM"), not
   muted to `—`.
@@ -125,17 +133,20 @@ tick but doesn't own it.
   (waits out the outgoing instance) instead of exiting on contention. `main` best-effort
   deletes leftover `.old`/`.new` on every startup.
 - The pure layer (`parse_version`, `is_newer_version`, `select_release_assets`,
-  `parse_sha256_sidecar`, `verify_sha256`, `should_check_for_update`) is unit-tested;
-  `fetch_latest_release`/`download_to`/`apply_update` are the impure shell.
+  `parse_sha256_sidecar`, `verify_sha256`, `should_check_for_update`) is unit-tested, and so
+  is `apply_update` with the network faked. A failed release check isn't stamped into
+  `last_update_check`, so `update_loop`'s hourly wake retries it instead of waiting a day.
 
 ### Windows-specific plumbing
 
 - `_signed32` and the `& 0xFFFFFFFF` masking exist because `GetWindowLongW` returns signed
   LONGs but Python bitwise ops on negatives overflow ctypes' 32-bit conversion. Don't
   remove the masking when touching window styles.
-- `TaskbarBadge._declare_prototypes` sets explicit `argtypes`/`restype` for every Win32
-  call — required so HWNDs aren't truncated on 64-bit Python. New Win32 calls need an entry
-  here.
+- `_user32()` (cached) sets explicit `argtypes`/`restype` for every user32 call, once, on a
+  private `WinDLL` — required so HWNDs aren't truncated on 64-bit Python. New Win32 calls
+  need an entry there. Never declare prototypes or ctypes structs per call: Python 3.12 keeps
+  every struct class forever (that leaked ~170 MB/day at the 3s `reposition` rate), and two
+  struct types for one function made `GetMonitorInfoW` fail inside the fullscreen guard.
 - **NEVER reparent the badge into `Shell_TrayWnd`** (no `SetParent`/`WS_CHILD`). A previous
   version did, which made our window a child of explorer's taskbar; explorer's UI thread
   then sent it synchronous messages and **hung waiting on our tk loop** whenever the loop
@@ -143,7 +154,7 @@ tick but doesn't own it.
   explorer. The badge is now a standalone `WS_EX_TOPMOST | TOOLWINDOW | NOACTIVATE | LAYERED`
   overlay positioned in **screen coords** via non-blocking reads (`GetWindowRect`/
   `FindWindowExW`) + `MoveWindow` on our own window + a periodic `SetWindowPos(HWND_TOPMOST)`
-  re-assert. `reposition` skips `MoveWindow` when geometry is unchanged (`should_move`).
+  re-assert. `reposition` skips `MoveWindow` when geometry is unchanged.
   Explorer never waits on an unowned window, so it can't hang us or be hung by us.
 - **Topmost is re-asserted on a fast ~120ms timer** (`_topmost_tick` → `_assert_topmost`),
   separate from the 750ms `tick`. Without it, clicking a taskbar item raises the (topmost)
@@ -156,7 +167,8 @@ tick but doesn't own it.
   while a fullscreen app is foreground, so the aggressive topmost doesn't cover videos/games.
   It is **monitor-scoped**: it compares the foreground window's `HMONITOR` to the badge's
   (the docked taskbar's, `_dock_hwnd`) and only hides when they match — a fullscreen app on
-  another display leaves the badge visible.
+  another display leaves the badge visible. The desktop (`Progman`/`WorkerW`, foreground
+  after a desktop click or Win+D) covers its monitor too and is excluded in `is_fullscreen`.
 - **The badge can dock to a chosen display (multi-monitor).** It floats over a taskbar, so it
   can live on any monitor that has one: the primary `Shell_TrayWnd` or a secondary monitor's
   `Shell_SecondaryTrayWnd` (present only with Windows' "Show my taskbar on all displays").
@@ -166,6 +178,8 @@ tick but doesn't own it.
   display" submenu applies **live**. On a secondary taskbar (no `TrayNotifyWnd`, no Widgets
   button) the badge anchors via the right-edge fallback; the cached Widgets obstacles are
   folded in **only** when docked to the primary (they're in primary-monitor coords).
+  `compute_badge_x` clamps to the docked taskbar's left edge, not 0: screen x is negative on
+  a monitor placed left of the primary.
 - **Badge positioning is collision-aware (Win11).** On Windows 11 the Widgets/weather button
   lives in a XAML composition island with **no HWND**, so Win32 can't see it.
   `detect_taskbar_obstacles` uses **UI Automation** (`comtypes`) to find right-docked
@@ -195,6 +209,9 @@ the display choice applies live (`reposition` reads it each tick).
   internal fields that are intentionally ignored. `parse_usage` skips any window that's
   missing or has a null `utilization`.
 - Color thresholds: `>80%` high (red), `>=50%` warn (amber), else ok (green); gray when
-  stale. Both icon (RGB tuples) and taskbar text (hex) have parallel pickers.
+  stale. One picker, `pick_color`, serves the icon (`ICON_PALETTE`, RGB) and the taskbar
+  text (`TEXT_PALETTE`, hex).
+- Threshold toasts (80/95%) fire once per 5h window, keyed on `resets_at` truncated to the
+  minute: the API adds per-request microseconds, so the raw value changes on every poll.
 - Lazy imports inside methods (`PIL`, `tkinter`, `pystray`, `winreg`, `ctypes`) keep the
   pure-function layer importable without a display or Windows.

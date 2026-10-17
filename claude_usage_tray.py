@@ -1,38 +1,11 @@
 """
-claude_usage_tray.py — Claude plan-usage widget for the Windows taskbar.
-
-Two display modes:
-  1. Taskbar text (default): "Claude ~ weekly 2% | session 8%" painted
-     directly on the taskbar surface, left of the tray area. Falls back to
-     mode 2 automatically if the embed fails.
-  2. Tray icon (always on): colored square with session % in the system
-     tray, carrying the menu and toast notifications.
-
-Tray menu toggles:
-  - "Run at startup": registers/removes an HKCU Run entry, which also makes
-    the app appear in Task Manager > Startup apps with its own toggle.
-  - "Show on taskbar": persisted to %APPDATA%\\ClaudeUsage\\config.json,
-    applies on next launch.
-
-Packaging: pyinstaller --onefile --noconsole --name ClaudeUsage (see
-build.ps1). Script mode still works: pythonw claude_usage_tray.py.
-Debug the taskbar embed with: python claude_usage_tray.py --debug
-
-Data source: the unofficial endpoint Claude Code's /usage uses
-(GET https://api.anthropic.com/api/oauth/usage). Token is read from
-%USERPROFILE%\\.claude\\.credentials.json and auto-refreshed on 401 via
-the Claude Code OAuth refresh flow (new tokens are written back to the
-credentials file so Claude Code stays in sync).
-
-Deps:  pip install pystray pillow requests        (tkinter ships with Python)
-
-The taskbar embed is an unsupported Windows hack (DeskBands are deprecated);
-it re-attaches itself after explorer restarts and repositions as the tray
-grows/shrinks, but a future Windows update could break it. The tray icon
-mode has no such risk.
+claude_usage_tray.py — Claude plan-usage widget for Windows: a tray icon plus a
+text badge floating over the taskbar (an unowned overlay, never parented into
+explorer). Commands, architecture and the details not to change: CLAUDE.md.
 """
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -41,6 +14,7 @@ import sys
 import threading
 import time
 import webbrowser
+from collections import namedtuple
 from datetime import datetime
 
 import requests
@@ -53,6 +27,7 @@ import requests
 # and — crucially — avoids tripping the endpoint's rate limit. See fetch_usage.
 VERSION = "1.0.6"  # single source of truth; release.ps1/CI tag releases from this
 POLL_SECONDS = 300
+MIN_FETCH_GAP = 60   # a click/Refresh never fetches sooner than this after the last fetch
 APP_NAME = "ClaudeUsage"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
@@ -90,6 +65,9 @@ TEXT_OK = "#3fb950"
 TEXT_WARN = "#d29922"
 TEXT_HIGH = "#f85149"
 TEXT_STALE = "#8b949e"
+
+ICON_PALETTE = (COLOR_OK, COLOR_WARN, COLOR_HIGH, COLOR_STALE)
+TEXT_PALETTE = (TEXT_OK, TEXT_WARN, TEXT_HIGH, TEXT_STALE)
 
 # Color-key for taskbar transparency: everything this color becomes see-through.
 # Near-black so antialiasing fringes are invisible on a dark taskbar.
@@ -210,44 +188,29 @@ def build_badge_text(usage: dict, stale: bool) -> str:
     return txt
 
 
-def pick_color(pct, stale: bool):
+def pick_color(pct, stale: bool, palette):
+    """One threshold rule for icon and taskbar text: >80% high, >=50% warn,
+    else ok; gray when stale/unknown. `palette` is (ok, warn, high, stale)."""
+    ok, warn, high, gray = palette
     if stale or pct is None:
-        return COLOR_STALE
+        return gray
     if pct > 80:
-        return COLOR_HIGH
+        return high
     if pct >= 50:
-        return COLOR_WARN
-    return COLOR_OK
-
-
-def pick_text_color(pct, stale: bool) -> str:
-    if stale or pct is None:
-        return TEXT_STALE
-    if pct > 80:
-        return TEXT_HIGH
-    if pct >= 50:
-        return TEXT_WARN
-    return TEXT_OK
+        return warn
+    return ok
 
 
 # ----------------------------------------------------------------------------
 # Fetch result classification (pure — unit-testable without network)
 # ----------------------------------------------------------------------------
-class FetchResult:
-    """Outcome of one usage fetch.
-
-    kind: "ok" | "auth" | "rate_limited" | "error"
-      ok           -> .usage holds the parsed window dict
-      auth         -> 401; caller may refresh the token and retry once
-      rate_limited -> 429; .retry_after holds the server's backoff seconds
-      error        -> anything else (network, 5xx, bad body); keep last data
-    """
-    __slots__ = ("kind", "usage", "retry_after")
-
-    def __init__(self, kind, usage=None, retry_after=None):
-        self.kind = kind
-        self.usage = usage
-        self.retry_after = retry_after
+# Outcome of one usage fetch. kind: "ok" | "auth" | "rate_limited" | "error"
+#   ok           -> .usage holds the parsed window dict
+#   auth         -> 401; caller may refresh the token and retry once
+#   rate_limited -> 429; .retry_after holds the server's backoff seconds
+#   error        -> anything else (network, 5xx, bad body); keep last data
+FetchResult = namedtuple("FetchResult", "kind usage retry_after",
+                         defaults=(None, None))
 
 
 def parse_retry_after(headers, default: int = POLL_SECONDS) -> int:
@@ -308,14 +271,7 @@ def compute_next_wait(result: FetchResult, base_poll: int,
 # ----------------------------------------------------------------------------
 # Self-update (pure helpers — unit-testable without network)
 # ----------------------------------------------------------------------------
-class UpdateInfo:
-    """A newer release to offer. Value object, mirrors FetchResult."""
-    __slots__ = ("tag", "exe_url", "sha_url")
-
-    def __init__(self, tag, exe_url, sha_url):
-        self.tag = tag
-        self.exe_url = exe_url
-        self.sha_url = sha_url
+UpdateInfo = namedtuple("UpdateInfo", "tag exe_url sha_url")  # a newer release to offer
 
 
 def parse_version(tag: str) -> tuple:
@@ -563,6 +519,9 @@ def refresh_token():
         oauth["refreshToken"] = tok["refresh_token"]
     if tok.get("expires_in"):
         oauth["expiresAt"] = int(time.time() * 1000) + int(tok["expires_in"]) * 1000
+    # Re-read: Claude Code may have saved other entries (e.g. MCP logins) while
+    # we waited on the network. Replace only our key.
+    creds = read_credentials() or creds
     creds["claudeAiOauth"] = oauth
     try:
         write_credentials(creds)
@@ -672,7 +631,8 @@ def render_icon(pct, stale: bool):
 
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([0, 0, 63, 63], radius=14, fill=pick_color(pct, stale))
+    d.rounded_rectangle([0, 0, 63, 63], radius=14,
+                        fill=pick_color(pct, stale, ICON_PALETTE))
 
     text = "?" if pct is None else f"{min(pct, 999):.0f}"
     size = 44 if len(text) <= 2 else 32
@@ -694,11 +654,11 @@ def render_icon(pct, stale: bool):
 
 
 # ----------------------------------------------------------------------------
-# Taskbar-embedded text badge (Windows-only, opt-in via --taskbar)
+# Taskbar text badge (Windows-only, on by default; an overlay, never embedded)
 # ----------------------------------------------------------------------------
 # UIA state, lazily initialized; cached so we don't rebuild the COM object or
 # retry a broken UIA path every reposition.
-_uia = {"auto": None, "walker": None, "uia_mod": None, "failed": False}
+_uia = {"auto": None, "walker": None, "failed": False}
 
 
 def _uia_setup():
@@ -718,7 +678,7 @@ def _uia_setup():
             cc.gen_dir = gen
         UIA = cc.GetModule("UIAutomationCore.dll")
         auto = cc.CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
-        _uia.update(auto=auto, walker=auto.ControlViewWalker, uia_mod=UIA)
+        _uia.update(auto=auto, walker=auto.ControlViewWalker)
         return auto, _uia["walker"]
     except Exception:
         _uia["failed"] = True   # don't keep paying the cost of a broken path
@@ -770,6 +730,58 @@ def detect_taskbar_obstacles(taskbar_hwnd, taskbar_left, taskbar_width):
     return lefts
 
 
+@functools.cache
+def _user32():
+    """(user32, MONITORINFOEX) with explicit argtypes/restype for every Win32
+    call we make. Without them ctypes assumes C int everywhere: HWNDs get
+    truncated on 64-bit Python, and 32-bit style masks raise OverflowError.
+
+    Declared once, on a private WinDLL. Redeclaring per call leaked a new ctypes
+    class every 3s on Python 3.12 (~170 MB/day), and two struct types for one
+    function made GetMonitorInfoW reject the fullscreen guard's argument."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MONITORINFOEX(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD),
+                    ("szDevice", wintypes.WCHAR * 32)]
+
+    u = ctypes.WinDLL("user32")
+    u.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+    u.FindWindowW.restype = wintypes.HWND
+    u.FindWindowExW.argtypes = (wintypes.HWND, wintypes.HWND,
+                                wintypes.LPCWSTR, wintypes.LPCWSTR)
+    u.FindWindowExW.restype = wintypes.HWND
+    u.GetParent.argtypes = (wintypes.HWND,)
+    u.GetParent.restype = wintypes.HWND
+    u.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    u.GetClassNameW.restype = ctypes.c_int
+    u.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                               wintypes.UINT)
+    u.SetWindowPos.restype = wintypes.BOOL
+    u.GetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int)
+    u.GetWindowLongW.restype = wintypes.LONG
+    u.SetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.LONG)
+    u.SetWindowLongW.restype = wintypes.LONG
+    u.SetLayeredWindowAttributes.argtypes = (
+        wintypes.HWND, wintypes.COLORREF, wintypes.BYTE, wintypes.DWORD)
+    u.SetLayeredWindowAttributes.restype = wintypes.BOOL
+    u.MoveWindow.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, wintypes.BOOL)
+    u.MoveWindow.restype = wintypes.BOOL
+    u.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+    u.GetWindowRect.restype = wintypes.BOOL
+    u.GetForegroundWindow.argtypes = ()
+    u.GetForegroundWindow.restype = wintypes.HWND
+    u.MonitorFromWindow.argtypes = (wintypes.HWND, wintypes.DWORD)
+    u.MonitorFromWindow.restype = wintypes.HANDLE
+    u.GetMonitorInfoW.argtypes = (wintypes.HANDLE, ctypes.POINTER(MONITORINFOEX))
+    u.GetMonitorInfoW.restype = wintypes.BOOL
+    return u, MONITORINFOEX
+
+
 def enumerate_taskbar_displays():
     r"""Displays that currently host a Windows taskbar — the only places the
     badge can dock (it floats over a taskbar).
@@ -783,28 +795,11 @@ def enumerate_taskbar_displays():
     if sys.platform != "win32":
         return []
     import ctypes
-    from ctypes import wintypes
-
-    class MONITORINFOEX(ctypes.Structure):
-        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
-                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD),
-                    ("szDevice", wintypes.WCHAR * 32)]
 
     MONITOR_DEFAULTTONEAREST = 0x2
     MONITORINFOF_PRIMARY = 0x1
     try:
-        u = ctypes.windll.user32
-        u.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
-        u.FindWindowW.restype = wintypes.HWND
-        u.FindWindowExW.argtypes = (wintypes.HWND, wintypes.HWND,
-                                    wintypes.LPCWSTR, wintypes.LPCWSTR)
-        u.FindWindowExW.restype = wintypes.HWND
-        u.MonitorFromWindow.argtypes = (wintypes.HWND, wintypes.DWORD)
-        u.MonitorFromWindow.restype = wintypes.HANDLE
-        u.GetMonitorInfoW.argtypes = (wintypes.HANDLE,
-                                      ctypes.POINTER(MONITORINFOEX))
-        u.GetMonitorInfoW.restype = wintypes.BOOL
-
+        u, MONITORINFOEX = _user32()
         hwnds = []
         prim = u.FindWindowW("Shell_TrayWnd", None)
         if prim:
@@ -839,34 +834,26 @@ def enumerate_taskbar_displays():
         return []
 
 
-def compute_badge_x(obstacle_lefts, badge_w: int, margin: int,
-                    fallback_left=None) -> int:
+def compute_badge_x(obstacle_lefts, badge_w: int, margin: int, floor: int) -> int:
     """X for the badge so it sits clear of every right-docked obstacle.
 
-    `obstacle_lefts` are the left edges (relative to the taskbar) of things
-    the badge must not cover — the tray, the hidden-icons chevron, and on
-    Windows 11 the right-docked Widgets/weather button. The badge anchors to
-    the leftmost of them so it clears them all. Clamped to >= 0.
-    `fallback_left` is used when nothing was detected.
+    `obstacle_lefts` are the screen-coordinate left edges of things the badge
+    must not cover — the tray area, and on Windows 11 the right-docked
+    Widgets/weather button. The badge anchors to the leftmost of them so it
+    clears them all, clamped to `floor`: the docked taskbar's own left edge,
+    which is negative on a monitor placed left of the primary.
     """
-    lefts = [l for l in obstacle_lefts if l is not None]
-    if not lefts:
-        if fallback_left is None:
-            return 0
-        lefts = [fallback_left]
-    return max(min(lefts) - badge_w - margin, 0)
+    return max(min(obstacle_lefts) - badge_w - margin, floor)
 
 
-def should_move(prev, new) -> bool:
-    """True if the overlay's geometry tuple changed (or there's no prior).
-    Lets reposition() skip MoveWindow in the steady state."""
-    return prev != new
-
-
-def is_fullscreen(win_rect, monitor_rect) -> bool:
+def is_fullscreen(win_rect, monitor_rect, win_class: str = "") -> bool:
     """True if win_rect covers (>=) its monitor — a fullscreen app/video/game.
     Rects are (left, top, right, bottom). Borderless-fullscreen windows often
-    spill a few px past the monitor, so use coverage, not equality."""
+    spill a few px past the monitor, so use coverage, not equality. The
+    desktop (Progman/WorkerW, foreground after a desktop click or Win+D)
+    covers its monitor too but is not a fullscreen app."""
+    if win_class in ("Progman", "WorkerW"):
+        return False
     wl, wt, wr, wb = win_rect
     ml, mt, mr, mb = monitor_rect
     return wl <= ml and wt <= mt and wr >= mr and wb >= mb
@@ -929,11 +916,9 @@ class TaskbarBadge:
 
         self.app = app
         self.debug = debug
-        self.u32 = ctypes.windll.user32
-        self._declare_prototypes(ctypes)
+        self.u32, self._MONITORINFO = _user32()
         self.tk = tk
         self.tooltip = None
-        self.taskbar_hwnd = 0
         self._tick_count = 0
         self._obstacle_lefts = []   # absolute lefts from the background UIA probe
         self._last_geom = None      # (x,y,w,h) of the last MoveWindow; change-gate
@@ -994,55 +979,6 @@ class TaskbarBadge:
         except Exception as e:
             self.log(f"obstacle probe failed: {e}")
 
-    def _declare_prototypes(self, ctypes):
-        """Explicit argtypes/restypes for every Win32 call we make.
-
-        Without these, ctypes assumes C int everywhere: HWNDs get truncated
-        on 64-bit Python, and 32-bit style masks raise OverflowError.
-        """
-        from ctypes import wintypes
-
-        class MONITORINFO(ctypes.Structure):
-            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
-                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
-        self._MONITORINFO = MONITORINFO
-
-        u = self.u32
-        u.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
-        u.FindWindowW.restype = wintypes.HWND
-        u.FindWindowExW.argtypes = (wintypes.HWND, wintypes.HWND,
-                                    wintypes.LPCWSTR, wintypes.LPCWSTR)
-        u.FindWindowExW.restype = wintypes.HWND
-        u.GetParent.argtypes = (wintypes.HWND,)
-        u.GetParent.restype = wintypes.HWND
-        u.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int,
-                                   ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                   wintypes.UINT)
-        u.SetWindowPos.restype = wintypes.BOOL
-        u.GetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int)
-        u.GetWindowLongW.restype = wintypes.LONG
-        u.SetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.LONG)
-        u.SetWindowLongW.restype = wintypes.LONG
-        u.SetLayeredWindowAttributes.argtypes = (
-            wintypes.HWND, wintypes.COLORREF, wintypes.BYTE, wintypes.DWORD)
-        u.SetLayeredWindowAttributes.restype = wintypes.BOOL
-        u.MoveWindow.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_int,
-                                 ctypes.c_int, ctypes.c_int, wintypes.BOOL)
-        u.MoveWindow.restype = wintypes.BOOL
-        u.GetWindowRect.argtypes = (wintypes.HWND,
-                                    ctypes.POINTER(wintypes.RECT))
-        u.GetWindowRect.restype = wintypes.BOOL
-        u.IsWindow.argtypes = (wintypes.HWND,)
-        u.IsWindow.restype = wintypes.BOOL
-        # Foreground + monitor lookup for the fullscreen guard.
-        u.GetForegroundWindow.argtypes = ()
-        u.GetForegroundWindow.restype = wintypes.HWND
-        u.MonitorFromWindow.argtypes = (wintypes.HWND, wintypes.DWORD)
-        u.MonitorFromWindow.restype = wintypes.HANDLE
-        u.GetMonitorInfoW.argtypes = (wintypes.HANDLE,
-                                      ctypes.POINTER(MONITORINFO))
-        u.GetMonitorInfoW.restype = wintypes.BOOL
-
     # -- win32 plumbing -------------------------------------------------------
     def _rect(self, hwnd):
         import ctypes
@@ -1087,11 +1023,12 @@ class TaskbarBadge:
         self.root.update_idletasks()
         w = self.label.winfo_reqwidth()
         h = self.label.winfo_reqheight()
-        x = compute_badge_x([tray_left] + obstacles, w, self.MARGIN_RIGHT)
+        x = compute_badge_x([tray_left] + obstacles, w, self.MARGIN_RIGHT,
+                            floor=tb.left)
         y = tb.top + max((tb_h - h) // 2, 0)
 
         geom = (x, y, w, h)
-        if should_move(self._last_geom, geom):
+        if geom != self._last_geom:
             self.u32.MoveWindow(self.hwnd, x, y, w, h, True)
             self._last_geom = geom
             self.log(f"moved to ({x},{y}) {w}x{h}; tray_left={tray_left}, "
@@ -1111,6 +1048,8 @@ class TaskbarBadge:
             wr = self._rect(fg)
             if wr is None:
                 return False
+            cls = ctypes.create_unicode_buffer(16)
+            self.u32.GetClassNameW(fg, cls, 16)
             fg_mon = self.u32.MonitorFromWindow(fg, self.MONITOR_DEFAULTTONEAREST)
             mi = self._MONITORINFO()
             mi.cbSize = ctypes.sizeof(self._MONITORINFO)
@@ -1118,7 +1057,7 @@ class TaskbarBadge:
                 return False
             m = mi.rcMonitor
             covers = is_fullscreen((wr.left, wr.top, wr.right, wr.bottom),
-                                   (m.left, m.top, m.right, m.bottom))
+                                   (m.left, m.top, m.right, m.bottom), cls.value)
             if not covers:
                 return False           # not a fullscreen window — nothing to do
             # It IS fullscreen; hide only if it's on the badge's own monitor.
@@ -1129,7 +1068,8 @@ class TaskbarBadge:
                      f"dock={self._dock_hwnd} same_monitor={same} -> "
                      f"{'hide' if same else 'keep'}")
             return same
-        except Exception:
+        except Exception as e:
+            self.log(f"fullscreen check failed: {e!r}")
             return False
 
     def _assert_topmost(self):
@@ -1201,7 +1141,7 @@ class TaskbarBadge:
         fh = self.app.usage.get("five_hour")
         pct = fh["utilization"] if fh else None
         self.label.config(text=build_badge_text(self.app.usage, self.app.stale),
-                          fg=pick_text_color(pct, self.app.stale))
+                          fg=pick_color(pct, self.app.stale, TEXT_PALETTE))
 
         # Every ~3s: re-resolve the taskbar and reposition (handles explorer
         # restarts and tray-width changes — no re-embed needed since we're not
@@ -1235,6 +1175,8 @@ class UsageTray:
         self.icon = None
         self.rate_limited_until = None   # epoch seconds; None when not limited
         self.rate_limit_streak = 0       # consecutive 429s; drives backoff
+        self._last_fetch = 0.0           # epoch of the last real fetch (MIN_FETCH_GAP)
+        self._poll_lock = threading.Lock()  # one fetch at a time: loop vs clicks
         self.last_result = FetchResult("error")
         self._pending = None             # UpdateInfo when a newer release exists
         self.last_update_check = self.config.get("last_update_check")
@@ -1250,46 +1192,61 @@ class UsageTray:
 
         While inside a server-mandated 429 cooldown we DON'T hit the endpoint
         (a manual 'Refresh' otherwise just refreshes the rolling limit and
-        keeps it from draining)."""
-        if self.rate_limited_until and time.time() < self.rate_limited_until:
-            self._log(f"in cooldown until {fmt_clock(self.retry_at())}, "
-                      f"skipping fetch (streak={self.rate_limit_streak})")
-            self.update_icon()
+        keeps it from draining). Nor while another fetch is in flight, or
+        within MIN_FETCH_GAP of the last one, so repeated clicks on the badge
+        or 'Refresh' can't hammer the account-wide limit."""
+        if not self._poll_lock.acquire(blocking=False):
             return self.last_result
-        res = fetch_usage(log=self._log)
-        self.last_result = res
-        if res.kind == "ok":
-            self.usage = res.usage
-            self.stale = False
-            self.rate_limited_until = None
-            self.rate_limit_streak = 0
-            self.check_thresholds()
-        elif res.kind == "rate_limited":
-            self.stale = True          # keep last-known numbers, gray them out
-            self.rate_limit_streak += 1
-            wait = compute_next_wait(res, POLL_SECONDS, self.rate_limit_streak)
-            self.rate_limited_until = time.time() + wait
-            self._log(f"429 retry_after={res.retry_after} "
-                      f"streak={self.rate_limit_streak} backoff={wait}s "
-                      f"until {fmt_clock(self.retry_at())}")
-        else:                          # auth / error
-            self.stale = True
-        self._log(f"kind={res.kind} stale={self.stale} "
-                  f"usage={list((self.usage or {}).keys())}")
-        self.update_icon()
-        return res
+        try:
+            now = time.time()
+            if self.rate_limited_until and now < self.rate_limited_until:
+                self._log(f"in cooldown until {fmt_clock(self.retry_at())}, "
+                          f"skipping fetch (streak={self.rate_limit_streak})")
+                self.update_icon()
+                return self.last_result
+            if now - self._last_fetch < MIN_FETCH_GAP:
+                self._log(f"fetched {now - self._last_fetch:.0f}s ago, skipping")
+                return self.last_result
+            self._last_fetch = now
+            res = fetch_usage(log=self._log)
+            self.last_result = res
+            if res.kind == "ok":
+                self.usage = res.usage
+                self.stale = False
+                self.rate_limited_until = None
+                self.rate_limit_streak = 0
+                self.check_thresholds()
+            elif res.kind == "rate_limited":
+                self.stale = True          # keep last-known numbers, gray them out
+                self.rate_limit_streak += 1
+                wait = compute_next_wait(res, POLL_SECONDS, self.rate_limit_streak)
+                self.rate_limited_until = time.time() + wait
+                self._log(f"429 retry_after={res.retry_after} "
+                          f"streak={self.rate_limit_streak} backoff={wait}s "
+                          f"until {fmt_clock(self.retry_at())}")
+            else:                          # auth / error
+                self.stale = True
+            self._log(f"kind={res.kind} stale={self.stale} "
+                      f"usage={list((self.usage or {}).keys())}")
+            self.update_icon()
+            return res
+        finally:
+            self._poll_lock.release()
 
     def poll_loop(self):
         while not self.stop.is_set():
             try:
-                res = self.poll_once()
-                wait = compute_next_wait(res, POLL_SECONDS, self.rate_limit_streak)
+                self.poll_once()
+                # Sleep out any cooldown (a manual refresh may have set it
+                # mid-interval) instead of restarting a full backoff.
+                wait = (self.rate_limited_until - time.time() if self.retry_at()
+                        else POLL_SECONDS)
             except Exception as e:
                 self.stale = True
                 self.update_icon()
                 self._log(f"poll raised {e!r}; retrying in {POLL_SECONDS}s")
                 wait = POLL_SECONDS
-            self._log(f"sleeping {wait}s")
+            self._log(f"sleeping {wait:.0f}s")
             self.stop.wait(wait)
 
     # -- self-update ------------------------------------------------------------
@@ -1309,12 +1266,16 @@ class UsageTray:
                 return
 
     def check_for_update(self):
-        """Fetch latest release; if newer, arm the tray item + toast once."""
+        """Fetch latest release; if newer, arm the tray item + toast once.
+        A failed fetch (e.g. offline at login) isn't stamped, so the hourly
+        wake in update_loop retries it instead of waiting a day."""
+        info = fetch_latest_release()
+        if not info:
+            return
         self.last_update_check = time.time()
         self.config["last_update_check"] = self.last_update_check
         save_config(self.config)
-        info = fetch_latest_release()
-        if info and is_newer_version(info.tag, VERSION):
+        if is_newer_version(info.tag, VERSION):
             already = self._pending is not None and self._pending.tag == info.tag
             self._pending = info
             if self.icon:
@@ -1419,7 +1380,10 @@ class UsageTray:
         fh = self.usage.get("five_hour")
         if not fh:
             return
-        key = fh["resets_at"].isoformat() if fh["resets_at"] else None
+        # resets_at carries per-request microseconds; compare to the minute or
+        # every poll looks like a new window and re-fires the toasts.
+        key = (fh["resets_at"].replace(second=0, microsecond=0)
+               if fh["resets_at"] else None)
         if key != self.window_key:     # new 5h window -> re-arm toasts
             self.window_key = key
             self.notified.clear()
@@ -1590,11 +1554,6 @@ def main():
     args = ap.parse_args()
 
     cleanup_update_leftovers()
-
-    if not os.path.exists(CRED_PATH):
-        _warn(f"Credentials not found at {CRED_PATH}.\n"
-              "Authenticate Claude Code first, then relaunch.\n")
-        sys.exit(1)
 
     # Only one instance may poll; a second would double the request rate into
     # the rate-limited usage endpoint. Hold the handle for the process life.
