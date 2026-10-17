@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -277,6 +278,65 @@ class SingleInstance(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Self-update: pure helpers
 # ---------------------------------------------------------------------------
+class _Key(dict):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeWinreg:
+    """Just enough winreg for the startup toggle; never touches the real
+    registry (a real Run entry would launch at the next sign-in)."""
+    HKEY_CURRENT_USER = KEY_SET_VALUE = REG_SZ = 0
+
+    def __init__(self, keys):
+        self.keys = {path: _Key(values) for path, values in keys.items()}
+
+    def OpenKey(self, _root, path, *_):
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        return self.keys[path]
+
+    def QueryValueEx(self, key, name):
+        if name not in key:
+            raise FileNotFoundError(name)
+        return key[name], 0
+
+    def SetValueEx(self, key, name, _reserved, _type, value):
+        key[name] = value
+
+    def DeleteValue(self, key, name):
+        if key.pop(name, None) is None:
+            raise FileNotFoundError(name)
+
+
+class StartupToggle(unittest.TestCase):
+    """Task Manager's Startup tab keeps its own off switch beside our Run
+    value; the tray checkmark must honor it and turning on must clear it."""
+
+    def use_registry(self, approved):
+        fake = FakeWinreg({cu.RUN_KEY: {cu.APP_NAME: '"x.exe"'},
+                           cu.APPROVED_KEY: approved})
+        p = mock.patch.dict(sys.modules, {"winreg": fake})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_switched_off_in_task_manager_reads_as_off(self):
+        self.use_registry({cu.APP_NAME: b"\x03" + bytes(11)})
+        self.assertFalse(cu.is_startup_enabled())
+
+    def test_never_touched_in_task_manager_reads_as_on(self):
+        self.use_registry({})
+        self.assertTrue(cu.is_startup_enabled())
+
+    def test_turning_on_clears_task_manager_off_switch(self):
+        self.use_registry({cu.APP_NAME: b"\x03" + bytes(11)})
+        cu.set_startup(True)
+        self.assertTrue(cu.is_startup_enabled())
+
+
 class ParseVersion(unittest.TestCase):
     def test_strips_leading_v(self):
         self.assertEqual(cu.parse_version("v1.2.0"), (1, 2, 0))

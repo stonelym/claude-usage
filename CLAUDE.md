@@ -220,7 +220,12 @@ tick but doesn't own it.
   typelib wrapper at first use; when frozen, `_uia_setup` redirects `gen_dir` to
   `%APPDATA%\ClaudeUsage\comtypes_gen` (site-packages is read-only in a `--onefile` exe).
 - Startup-at-login is an HKCU `...\Run` entry (`set_startup`/`is_startup_enabled`), which
-  is what surfaces the app in Task Manager > Startup apps.
+  is what surfaces the app in Task Manager > Startup apps. Task Manager's on/off switch is a
+  separate flag (`APPROVED_KEY`, first byte 2 = on, 3 = off): the tray checkmark reads both,
+  and turning startup on deletes that flag so a Task Manager "off" can't stick.
+- The installer closes a running copy with a plain `taskkill` first and `/f` only as a
+  fallback: a forced kill also kills PyInstaller's parent process, which then never deletes
+  its 42 MB `_MEI` unpack dir in `%TEMP%`.
 
 ### Config
 

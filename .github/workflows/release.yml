@@ -47,10 +47,7 @@ jobs:
           $h = (Get-FileHash dist/ClaudeUsage.exe -Algorithm SHA256).Hash.ToLower()
           Set-Content dist/ClaudeUsage.exe.sha256 $h -NoNewline -Encoding ascii
 
-      - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
-
-      - name: Build installer (setup.exe)
+      - name: Build installer (setup.exe)   # Inno Setup ships on the windows-latest image
         run: >
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           /DAppVersion=${{ env.VER }} installer\ClaudeUsage.iss

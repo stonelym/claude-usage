@@ -56,13 +56,24 @@ Type: filesandordirs; Name: "{app}"
 Type: filesandordirs; Name: "{userappdata}\ClaudeUsage"
 
 [Code]
-// Close a running instance so its locked exe can be replaced (install/upgrade).
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+// Close any running instance so its locked exe can be replaced or deleted.
+// Ask first (no /f): the app exits normally and PyInstaller's parent process
+// deletes its 42 MB unpack dir in %TEMP% (under a second, tested live). A
+// forced kill skips that cleanup, so /f is only the fallback.
+procedure CloseRunningApp;
 var
   ResultCode: Integer;
 begin
+  if Exec(ExpandConstant('{sys}\taskkill.exe'), '/im ClaudeUsage.exe', '',
+          SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+    Sleep(2000);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im ClaudeUsage.exe', '',
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  CloseRunningApp;
   Result := '';
 end;
 
@@ -70,13 +81,10 @@ end;
 // Run value even when startup was turned on from the tray menu (the [Registry]
 // entry above only covers the installer's own startup task).
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-var
-  ResultCode: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
-    Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im ClaudeUsage.exe', '',
-         SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    CloseRunningApp;
     RegDeleteValue(HKEY_CURRENT_USER,
                    'Software\Microsoft\Windows\CurrentVersion\Run', 'ClaudeUsage');
   end;

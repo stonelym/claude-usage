@@ -31,6 +31,7 @@ MIN_FETCH_GAP = 60   # a click/Refresh never fetches sooner than this after the 
 SIGNIN_RECHECK = 30  # signed out: re-read the token file this often (no request is made)
 APP_NAME = "ClaudeUsage"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -439,20 +440,25 @@ def startup_command() -> str:
 
 
 def is_startup_enabled() -> bool:
-    """True if our HKCU Run entry exists.
+    """True if our HKCU Run entry exists and Task Manager hasn't switched it off.
 
-    The Run key is one of the two sources Task Manager's Startup tab reads,
-    so once enabled here the entry appears there with its own Enable/Disable
-    toggle (Windows tracks that separately in StartupApproved without
-    touching our value).
+    The Run key is one of the two sources Task Manager's Startup tab reads.
+    Its Enable/Disable toggle is a separate per-entry flag under
+    StartupApproved\\Run (first byte 2 = on, 3 = off; absent = on) that never
+    touches our Run value, so both must be read.
     """
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
             winreg.QueryValueEx(k, APP_NAME)
-        return True
     except (ImportError, OSError):
         return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APPROVED_KEY) as k:
+            flag = winreg.QueryValueEx(k, APP_NAME)[0]
+    except OSError:
+        return True                   # never switched off in Task Manager
+    return not (isinstance(flag, bytes) and flag[:1] and flag[0] & 1)
 
 
 def set_startup(enabled: bool) -> None:
@@ -463,6 +469,13 @@ def set_startup(enabled: bool) -> None:
             if enabled:
                 winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ,
                                   startup_command())
+                # Clear Task Manager's "off" too, or the entry stays disabled.
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APPROVED_KEY,
+                                        0, winreg.KEY_SET_VALUE) as a:
+                        winreg.DeleteValue(a, APP_NAME)
+                except OSError:
+                    pass
             else:
                 try:
                     winreg.DeleteValue(k, APP_NAME)
