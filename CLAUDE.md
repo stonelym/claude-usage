@@ -20,12 +20,12 @@ pythonw claude_usage_tray.py
 # Run with a visible console + taskbar-embed diagnostics
 python claude_usage_tray.py --debug
 
-# Force taskbar text mode on and persist it to config
-python claude_usage_tray.py --taskbar
-
-# Install deps for local dev (tkinter ships with Python). requirements-build.txt pins every
-# package CI ships, transitive ones too; regenerate it with pip freeze in a clean 3.12 venv.
-pip install -r requirements-build.txt
+# Install deps for local dev (tkinter ships with Python). requirements-build.txt locks every
+# package CI ships, transitive ones too, by version and file hash. To change it, in a clean
+# Python 3.12 venv: pip install the new top-level pins, pip freeze (keep setuptools, drop pip),
+# then pip download --no-deps -r requirements-build.txt -d wheels and add each file's
+# sha256 as --hash=sha256:<hex>.
+pip install --require-hashes -r requirements-build.txt
 
 # Run the unit tests (stdlib unittest, no display/network needed)
 python -m unittest -v test_claude_usage
@@ -117,9 +117,11 @@ tick but doesn't own it.
   "Refresh" can't hammer it; `--debug` emits `[poll]` lines (HTTP status, kind, streak,
   backoff) so a stuck-stale state is diagnosable on the live machine.
   The rate-limited state is surfaced in the tooltip ("Rate-limited, retry HH:MM"), not
-  muted to `—`.
+  muted to `—`. The fetch gap and the cooldown run on `time.monotonic()`, so setting the PC
+  clock back can't stall polling; it counts from boot, so "never fetched" is `-inf`, not 0.
 - **Single instance only** (`acquire_single_instance`, a named mutex). Two instances both
-  polling is what trips the rate limit; a second launch exits immediately.
+  polling is what trips the rate limit; a second launch exits immediately. If Windows won't
+  create the mutex at all, the app starts anyway: silently never starting is worse.
 - All of the above (`FetchResult`, `classify_usage_response`, `parse_retry_after`,
   `compute_next_wait`) is pure and unit-tested; `fetch_usage` is just the network shell
   around it.

@@ -355,7 +355,9 @@ def should_check_for_update(now: float, last_check, interval_s: int) -> bool:
     """True if at least interval_s has elapsed since last_check (or never)."""
     if last_check is None:
         return True
-    return (now - last_check) >= interval_s
+    # A last check "in the future" means the clock was set back: check now
+    # rather than wait for the clock to catch up.
+    return not (0 <= now - last_check < interval_s)
 
 
 # ----------------------------------------------------------------------------
@@ -370,13 +372,19 @@ def load_config() -> dict:
         return {}
 
 
+_config_lock = threading.Lock()
+
+
 def save_config(cfg: dict) -> None:
+    # The update thread and menu clicks both save: one writer at a time (they
+    # share the .tmp file), and dump a copy so a key added mid-dump can't break it.
     try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-        os.replace(tmp, CONFIG_PATH)
+        with _config_lock:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dict(cfg), f, indent=2)
+            os.replace(tmp, CONFIG_PATH)
     except OSError:
         pass
 
@@ -387,7 +395,8 @@ def acquire_single_instance(name: str = APP_NAME):
     Two instances each polling the rate-limited usage endpoint is exactly
     what trips the 429s. Returns a handle to keep alive for the process
     lifetime if we're first, or None if another instance already holds it.
-    Non-Windows is a no-op (returns True).
+    Non-Windows is a no-op (returns True), and so is a mutex Windows won't
+    create: starting unguarded beats silently never starting.
     """
     if sys.platform != "win32":
         return True
@@ -400,7 +409,7 @@ def acquire_single_instance(name: str = APP_NAME):
     handle = k32.CreateMutexW(None, False, f"{name}_singleton")
     ERROR_ALREADY_EXISTS = 183
     if not handle:
-        return None
+        return True
     if k32.GetLastError() == ERROR_ALREADY_EXISTS:
         # CreateMutexW still hands back a valid handle to the existing object;
         # close it so a retry loop doesn't accumulate handles.
@@ -416,12 +425,12 @@ def acquire_single_instance_blocking(name: str = APP_NAME, timeout_s: float = 10
     one-shot variant so a genuine duplicate still exits immediately."""
     if sys.platform != "win32":
         return True
-    deadline = time.time() + timeout_s
+    deadline = time.monotonic() + timeout_s
     while True:
         handle = acquire_single_instance(name)
         if handle is not None:
             return handle
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             return None
         time.sleep(0.25)
 
@@ -1158,9 +1167,11 @@ class UsageTray:
         self.window_key = None
         self.stop = threading.Event()
         self.icon = None
-        self.rate_limited_until = None   # epoch seconds; None when not limited
+        # Gaps and cooldowns run on time.monotonic(), which a clock change can't
+        # move; it counts from boot, so "never fetched" is -inf, not 0.
+        self.rate_limited_until = None   # monotonic; None when not limited
         self.rate_limit_streak = 0       # consecutive 429s; drives backoff
-        self._last_fetch = 0.0           # epoch of the last real fetch (MIN_FETCH_GAP)
+        self._last_fetch = float("-inf")  # monotonic time of the last real fetch
         self._poll_lock = threading.Lock()  # one fetch at a time: loop vs clicks
         self._update_lock = threading.Lock()  # one self-update at a time
         self.last_result = FetchResult("error")
@@ -1184,7 +1195,7 @@ class UsageTray:
         if not self._poll_lock.acquire(blocking=False):
             return self.last_result
         try:
-            now = time.time()
+            now = time.monotonic()
             if self.rate_limited_until and now < self.rate_limited_until:
                 self._log(f"in cooldown until {fmt_clock(self.retry_at())}, "
                           f"skipping fetch (streak={self.rate_limit_streak})")
@@ -1197,7 +1208,7 @@ class UsageTray:
             res = fetch_usage(log=self._log)
             self.last_result = res
             if res.kind == "signed_out":
-                self._last_fetch = 0.0     # no request was made; don't hold back a Refresh
+                self._last_fetch = float("-inf")  # no request made; don't hold back a Refresh
             if res.kind == "ok":
                 self.usage = res.usage
                 self.stale = False
@@ -1208,7 +1219,7 @@ class UsageTray:
                 self.stale = True          # keep last-known numbers, gray them out
                 self.rate_limit_streak += 1
                 wait = compute_next_wait(res, POLL_SECONDS, self.rate_limit_streak)
-                self.rate_limited_until = time.time() + wait
+                self.rate_limited_until = time.monotonic() + wait
                 self._log(f"429 retry_after={res.retry_after} "
                           f"streak={self.rate_limit_streak} backoff={wait}s "
                           f"until {fmt_clock(self.retry_at())}")
@@ -1229,7 +1240,7 @@ class UsageTray:
                 # mid-interval) instead of restarting a full backoff. Signed
                 # out, re-check the token file soon so the badge recovers
                 # right after Claude Code signs back in.
-                wait = (self.rate_limited_until - time.time() if self.retry_at()
+                wait = (self.rate_limited_until - time.monotonic() if self.retry_at()
                         else SIGNIN_RECHECK if self.last_result.kind == "signed_out"
                         else POLL_SECONDS)
             except Exception as e:
@@ -1422,8 +1433,10 @@ class UsageTray:
     # -- UI ---------------------------------------------------------------------
     def retry_at(self):
         """datetime the rate limit lifts, or None if not (still) limited."""
-        if self.rate_limited_until and time.time() < self.rate_limited_until:
-            return datetime.fromtimestamp(self.rate_limited_until).astimezone()
+        left = (self.rate_limited_until - time.monotonic()
+                if self.rate_limited_until else 0)
+        if left > 0:
+            return datetime.fromtimestamp(time.time() + left).astimezone()
         return None
 
     def tooltip_text(self):
@@ -1529,14 +1542,10 @@ class UsageTray:
 
         badge = None
         if taskbar:
-            if sys.platform != "win32":
-                _warn("--taskbar is Windows-only; tray icon mode.\n")
-            else:
-                try:
-                    badge = TaskbarBadge(self, debug=debug)
-                except Exception as e:
-                    _warn(f"Taskbar embed failed ({e!r}); tray icon mode.\n")
-                    badge = None
+            try:
+                badge = TaskbarBadge(self, debug=debug)
+            except Exception as e:
+                _warn(f"Taskbar embed failed ({e!r}); tray icon mode.\n")
 
         if badge:
             # tk needs the main thread; pystray runs its own message loop fine
@@ -1571,8 +1580,6 @@ def cleanup_update_leftovers():
 
 def main():
     ap = argparse.ArgumentParser(description="Claude usage taskbar widget")
-    ap.add_argument("--taskbar", action="store_true",
-                    help="force taskbar text mode on (and persist it to config)")
     ap.add_argument("--debug", action="store_true",
                     help="print taskbar-embed diagnostics (run with python, not pythonw)")
     ap.add_argument("--updated", action="store_true",
@@ -1597,9 +1604,6 @@ def main():
     threading.Timer(5, cleanup_update_leftovers).start()
 
     config = load_config()
-    if args.taskbar:
-        config["taskbar"] = True
-        save_config(config)
     # Taskbar mode defaults ON; embed failures fall back to tray-only anyway.
     UsageTray(config).run(taskbar=config.get("taskbar", True), debug=args.debug)
 

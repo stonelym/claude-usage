@@ -14,14 +14,17 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false   # keep the write token out of .git/config while build tools run
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # Every package pinned, transitive ones too: each build reaches all installs.
+      # Every package locked by version and file hash, transitive ones too:
+      # each build reaches all installs.
       - name: Install dependencies
-        run: python -m pip install -r requirements-build.txt
+        run: python -m pip install --require-hashes -r requirements-build.txt
 
       - name: Unit tests (gate)
         run: python -m unittest -v test_claude_usage

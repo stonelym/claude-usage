@@ -274,6 +274,12 @@ class SingleInstance(unittest.TestCase):
         second = cu.acquire_single_instance("ClaudeUsageUnitTestB")
         self.assertIsNone(second)
 
+    def test_mutex_windows_wont_create_still_starts(self):
+        # Silently never starting is worse than a rare second instance.
+        with mock.patch("ctypes.windll") as windll:
+            windll.kernel32.CreateMutexW.return_value = None
+            self.assertTrue(cu.acquire_single_instance("ClaudeUsageUnitTestC"))
+
 
 # ---------------------------------------------------------------------------
 # Self-update: pure helpers
@@ -452,6 +458,10 @@ class ShouldCheckForUpdate(unittest.TestCase):
     def test_true_when_never_checked(self):
         self.assertTrue(cu.should_check_for_update(now=1000, last_check=None, interval_s=600))
 
+    def test_true_when_clock_was_set_back(self):
+        # Waiting for the clock to pass the old stamp could take days.
+        self.assertTrue(cu.should_check_for_update(now=1000, last_check=90000, interval_s=600))
+
 
 class CheckForUpdate(unittest.TestCase):
     def test_failed_fetch_is_retried_not_pushed_a_day_out(self):
@@ -574,7 +584,7 @@ class PollOnce(unittest.TestCase):
             self.fetches += 1
             return self.replies.pop(0)
         for target, attr, value in ((cu, "fetch_usage", fake_fetch),
-                                    (cu.time, "time", lambda: self.now)):
+                                    (cu.time, "monotonic", lambda: self.now)):
             p = mock.patch.object(target, attr, value)
             p.start()
             self.addCleanup(p.stop)
@@ -619,6 +629,18 @@ class PollOnce(unittest.TestCase):
         self.app.stop = mock.Mock(is_set=lambda: bool(waits), wait=waits.append)
         self.app.poll_loop()
         self.assertEqual(waits, [100])
+
+    def test_first_fetch_right_after_boot(self):
+        # The monotonic clock counts from boot and the Run key starts us early.
+        self.now = 10.0
+        self.poll(self.OK)
+        self.assertEqual(self.fetches, 1)
+
+    def test_wall_clock_set_back_does_not_stall_polling(self):
+        with mock.patch.object(cu.time, "time", lambda: 0.0):
+            self.poll(self.OK)
+            self.poll(self.OK, after=cu.POLL_SECONDS)
+        self.assertEqual(self.fetches, 2)
 
     def test_signed_out_rechecks_soon_and_never_blocks_a_refresh(self):
         # Right after Claude Code signs back in, a click must fetch.
