@@ -124,6 +124,12 @@ class TooltipRateLimited(unittest.TestCase):
         self.assertIn("Session 8%", tip)
         self.assertIn("ate-limit", tip)
 
+    def test_signed_out_says_so_instead_of_stale(self):
+        usage = {"five_hour": {"utilization": 8.0, "resets_at": None}}
+        tip = cu.build_tooltip(usage, stale=True, signed_out=True)
+        self.assertIn("Signed out", tip)
+        self.assertNotIn("STALE", tip)
+
 
 # ---------------------------------------------------------------------------
 # Bug 2: collision-aware taskbar badge positioning
@@ -222,9 +228,15 @@ class ComputeBadgeX(unittest.TestCase):
         self.assertEqual(x, 2181 - 97 - 10)
         self.assertLess(x + 97, 2181)  # badge ends before the widget begins
 
-    def test_clamps_to_taskbar_left(self):
+    def test_no_room_beside_app_buttons_is_none(self):
+        # Live numbers from a crowded 1280px taskbar: app buttons end at 879,
+        # tray starts at 988, badge is 251 wide. It would cover three buttons.
+        self.assertIsNone(
+            cu.compute_badge_x([988], badge_w=251, margin=10, floor=879 + 10))
+
+    def test_fits_right_after_app_buttons(self):
         self.assertEqual(
-            cu.compute_badge_x([50], badge_w=97, margin=10, floor=0), 0)
+            cu.compute_badge_x([988], badge_w=80, margin=10, floor=889), 898)
 
     def test_monitor_left_of_primary_keeps_negative_x(self):
         # Secondary taskbar spans x -1920..0; its fallback anchor is -250.
@@ -348,7 +360,6 @@ class ParseSha256Sidecar(unittest.TestCase):
 
 class VerifySha256(unittest.TestCase):
     def _tmp(self, data: bytes):
-        import tempfile, os
         fd, path = tempfile.mkstemp()
         with os.fdopen(fd, "wb") as f:
             f.write(data)
@@ -356,7 +367,6 @@ class VerifySha256(unittest.TestCase):
         return path
 
     def test_matching_hash(self):
-        import hashlib
         data = b"hello world"
         path = self._tmp(data)
         self.assertTrue(cu.verify_sha256(path, hashlib.sha256(data).hexdigest()))
@@ -366,7 +376,6 @@ class VerifySha256(unittest.TestCase):
         self.assertFalse(cu.verify_sha256(path, "0" * 64))
 
     def test_case_insensitive(self):
-        import hashlib
         data = b"abc"
         path = self._tmp(data)
         self.assertTrue(
@@ -446,6 +455,27 @@ class ApplyUpdate(unittest.TestCase):
         self.assertEqual(self.installed(), b"OLD")
         self.app._relaunch.assert_not_called()
 
+    def test_new_exe_that_wont_start_is_rolled_back_and_app_stays_up(self):
+        # e.g. antivirus blocks the fresh unsigned exe at launch
+        self.app._relaunch = mock.Mock(return_value=False)
+        self.app.apply_update()
+        self.assertEqual(self.installed(), b"OLD")
+        self.app.quit.assert_not_called()
+
+
+class Relaunch(unittest.TestCase):
+    def test_new_exe_unpacks_fresh_instead_of_borrowing_our_temp_dir(self):
+        # Without the reset, the relaunched --onefile exe runs from the old
+        # process's _MEI dir, whose launcher then hangs on a cleanup dialog.
+        with mock.patch("subprocess.Popen") as popen:
+            self.assertTrue(cu.UsageTray(config={})._relaunch("x.exe", "."))
+        self.assertEqual(popen.call_args.kwargs["env"]
+                         ["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+
+    def test_launch_failure_is_reported(self):
+        with mock.patch("subprocess.Popen", side_effect=OSError(225, "blocked")):
+            self.assertFalse(cu.UsageTray(config={})._relaunch("x.exe", "."))
+
 
 # ---------------------------------------------------------------------------
 # Poll state machine (fetch_usage and the clock faked; no network)
@@ -521,31 +551,43 @@ class ThresholdToasts(unittest.TestCase):
         self.assertEqual(app.icon.notify.call_count, 2)   # 06:20 window, 11:20 window
 
 
-class RefreshToken(unittest.TestCase):
-    def test_keeps_entries_claude_code_saved_meanwhile(self):
+class FetchUsage(unittest.TestCase):
+    """The widget reads Claude Code's token but never renews it: a second
+    refresher can win a race and make Claude Code wipe the login."""
+
+    def fetch(self, oauth, status=200):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         path = os.path.join(d, ".credentials.json")
         with open(path, "w") as f:
-            json.dump({"claudeAiOauth": {"accessToken": "a1", "refreshToken": "r1"},
-                       "mcpOAuth": {}}, f)
-
-        def post(*a, **k):
-            # Claude Code saves an MCP login while our refresh is in flight.
-            with open(path) as f:
-                creds = json.load(f)
-            creds["mcpOAuth"]["github"] = {"token": "x"}
-            with open(path, "w") as f:
-                json.dump(creds, f)
-            return mock.Mock(status_code=200, json=lambda: {
-                "access_token": "a2", "refresh_token": "r2"})
+            json.dump({"claudeAiOauth": oauth}, f)
+        reply = mock.Mock(status_code=status, headers={}, json=lambda: {
+            "five_hour": {"utilization": 8, "resets_at": None}})
         with mock.patch.object(cu, "CRED_PATH", path), \
-                mock.patch.object(cu.requests, "post", post):
-            self.assertEqual(cu.refresh_token(), "a2")
-        with open(path) as f:
-            creds = json.load(f)
-        self.assertEqual(creds["mcpOAuth"], {"github": {"token": "x"}})
-        self.assertEqual(creds["claudeAiOauth"]["refreshToken"], "r2")
+                mock.patch.object(cu.requests, "get", return_value=reply) as get, \
+                mock.patch.object(cu.requests, "post") as post:
+            res = cu.fetch_usage()
+        post.assert_not_called()                  # never touches the token endpoint
+        return res, get.call_count
+
+    def test_valid_token_reads_usage(self):
+        res, gets = self.fetch({"accessToken": "a1",
+                                "expiresAt": (time.time() + 3600) * 1000})
+        self.assertEqual((res.kind, gets), ("ok", 1))
+
+    def test_401_is_auth_without_renewing(self):
+        res, gets = self.fetch({"accessToken": "a1", "refreshToken": "r1"}, 401)
+        self.assertEqual((res.kind, gets), ("auth", 1))
+
+    def test_expired_token_skips_the_request(self):
+        # Spares the rate-limited endpoint a guaranteed 401.
+        res, gets = self.fetch({"accessToken": "a1",
+                                "expiresAt": (time.time() - 60) * 1000})
+        self.assertEqual((res.kind, gets), ("auth", 0))
+
+    def test_token_wiped_by_claude_code_is_auth(self):
+        res, gets = self.fetch({"accessToken": "", "expiresAt": 0})
+        self.assertEqual((res.kind, gets), ("auth", 0))
 
 
 if __name__ == "__main__":

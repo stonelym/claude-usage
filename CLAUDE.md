@@ -48,10 +48,12 @@ entry (the same value the tray toggle uses) and a Start Menu shortcut.
 Tests live in `test_claude_usage.py` (stdlib `unittest` + `unittest.mock`, no extra deps). They
 cover the display-free logic: usage parsing, 429/Retry-After classification, poll-backoff math,
 the `poll_once`/`poll_loop` state machine (cooldown skip, click gap, in-flight lock; with
-`fetch_usage` and the clock faked), threshold toasts, the credentials write-back, the
-single-instance guard, badge-position math (`compute_badge_x`/`is_fullscreen`/`select_taskbar`),
-the self-update helpers (`parse_version`/`is_newer_version`/`select_release_assets`/
-`parse_sha256_sidecar`/`verify_sha256`), and the `apply_update` swap/rollback in a temp dir.
+`fetch_usage` and the clock faked), threshold toasts, `fetch_usage`'s token handling (reads,
+never renews), the single-instance guard, badge-position math
+(`compute_badge_x`/`is_fullscreen`/`select_taskbar`), the self-update helpers
+(`parse_version`/`is_newer_version`/`select_release_assets`/`parse_sha256_sidecar`/
+`verify_sha256`), the `apply_update` swap/rollback in a temp dir, and `_relaunch`'s
+PyInstaller environment reset.
 The pure functions are deliberately importable
 without a display — but the module does a top-level `import requests`, so `requests` must be
 installed to import it at all.
@@ -84,16 +86,19 @@ tick but doesn't own it.
 
 ### Data source & auth (the load-bearing detail)
 
-- Reads the OAuth token from Claude Code's own `~/.claude/.credentials.json`
-  (`claudeAiOauth.accessToken`).
+- Reads the OAuth token from Claude Code's own `.credentials.json` (`claudeAiOauth.accessToken`)
+  in `~/.claude`, or in `CLAUDE_CONFIG_DIR` when that is set.
 - GETs `https://api.anthropic.com/api/oauth/usage` with the `anthropic-beta:
   oauth-2025-04-20` header and a `claude-code/...` User-Agent.
-- On a 401 it does **one** refresh via the Claude Code OAuth flow and **writes the new
-  tokens back** to `.credentials.json` (atomic temp-file + `os.replace`) so Claude Code
-  stays in sync. This file is shared state with Claude Code — treat writes carefully: the
-  refresh re-reads it just before writing and replaces only `claudeAiOauth`, so entries
-  Claude Code saved meanwhile (e.g. `mcpOAuth` MCP logins) survive. A missing credentials
-  file isn't fatal: the app starts gray and picks up a login on the next poll.
+- **The app never renews the token and never writes `.credentials.json`.** Do not add a
+  refresh. Refresh tokens are single-use. Claude Code refreshes under its own cross-process
+  lock (`~/.claude/.oauth_refresh.lock`) and, when a refresh token comes back rejected,
+  **wipes the saved login**. So a second refresher that wins a race can sign the user out
+  of Claude Code. (The old refresh also posted to `console.anthropic.com/v1/oauth/token`,
+  which now 404s; Claude Code uses `platform.claude.com`.) A missing token, one past
+  `expiresAt`, or a 401 is `auth`: no request when the token is known dead, and the tooltip
+  says "Signed out: open Claude Code to sign in". The next poll picks up whatever Claude Code
+  renewed. A missing credentials file isn't fatal: the app starts gray.
 - **This endpoint rate-limits aggressively and account-wide.** It's meant to be hit
   on-demand (Claude Code's `/usage`), not polled. `POLL_SECONDS` is therefore **300**, not
   60 — do not lower it. `fetch_usage()` returns a `FetchResult` (`ok` / `auth` /
@@ -129,9 +134,19 @@ tick but doesn't own it.
 - The swap is the only delicate part (a running `--onefile` exe can't be overwritten, only
   renamed): rename `ClaudeUsage.exe`→`.old.exe`, `os.replace` the verified `.new.exe`→
   `ClaudeUsage.exe` (with rollback if that fails), relaunch with `--updated`, then quit to
-  release the mutex. `--updated` makes the relaunch use `acquire_single_instance_blocking`
-  (waits out the outgoing instance) instead of exiting on contention. `main` best-effort
-  deletes leftover `.old`/`.new` on every startup.
+  release the mutex. If the relaunch itself fails (e.g. antivirus blocks the new unsigned
+  exe), the old exe is moved back and the app keeps running. `--updated` makes the relaunch
+  use `acquire_single_instance_blocking` (waits out the outgoing instance) instead of exiting
+  on contention.
+- **The relaunch must pass `PYINSTALLER_RESET_ENVIRONMENT=1`.** Without it the new
+  `--onefile` exe inherits the old one's `_PYI_*` variables and runs out of the old
+  process's `_MEI` unpack dir (old DLLs). The old launcher then can't delete that dir and
+  hangs on a modal "Failed to remove temporary directory" dialog. Observed live on the
+  v1.0.6→v1.0.7 update. The fix lives on the *outgoing* side, so updating *from* a build
+  without it still shows the dialog once.
+- `main` deletes leftover `.old`/`.new` after it owns the mutex (so a duplicate launch can't
+  delete a running update's download), on a 5s timer (the outgoing launcher holds
+  `.old.exe` briefly after releasing the mutex).
 - The pure layer (`parse_version`, `is_newer_version`, `select_release_assets`,
   `parse_sha256_sidecar`, `verify_sha256`, `should_check_for_update`) is unit-tested, and so
   is `apply_update` with the network faked. A failed release check isn't stamped into
@@ -176,18 +191,26 @@ tick but doesn't own it.
   flag) and the pure `select_taskbar` picks the one matching `config["display"]`, falling
   back to primary if it's gone. `reposition` reads this each tick so the tray menu's "Show on
   display" submenu applies **live**. On a secondary taskbar (no `TrayNotifyWnd`, no Widgets
-  button) the badge anchors via the right-edge fallback; the cached Widgets obstacles are
-  folded in **only** when docked to the primary (they're in primary-monitor coords).
+  button) the badge anchors via the right-edge fallback; the cached UIA probe (Widgets
+  obstacles, app-button floor) is used **only** when docked to the primary (it's in
+  primary-monitor coords).
   `compute_badge_x` clamps to the docked taskbar's left edge, not 0: screen x is negative on
   a monitor placed left of the primary.
 - **Badge positioning is collision-aware (Win11).** On Windows 11 the Widgets/weather button
-  lives in a XAML composition island with **no HWND**, so Win32 can't see it.
-  `detect_taskbar_obstacles` uses **UI Automation** (`comtypes`) to find right-docked
-  ToggleButtons; their absolute left edges feed the pure `compute_badge_x` so the overlay
-  clears them. This UIA walk is the one heavy cross-process call, so it runs **once on a
-  background daemon thread** (`_probe_obstacles`), never on the tk loop — a slow walk can't
-  stall the overlay (and, since we're unparented, can't hang explorer). Result is cached for
-  `reposition` to read; UIA failure degrades to a tray-only anchor. `comtypes` generates a
+  and the app buttons live in XAML composition islands with **no HWND**, so Win32 can't see
+  them. `detect_taskbar_obstacles` uses **UI Automation** (`comtypes`) to find right-docked
+  ToggleButtons (left edges the badge must stay left of) and the right edge of the last
+  `Taskbar.TaskListButtonAutomationPeer` (the badge's floor). The pure `compute_badge_x`
+  returns `None` when the badge doesn't fit between them. The badge then hides (`_no_room`,
+  honored by `_assert_topmost`) rather than cover app buttons; the tray icon still shows the
+  session %. This happens on a crowded left-aligned taskbar on a small screen (e.g. a 1280px
+  Remote Desktop session).
+  The UIA walk (~20 ms) is the one heavy cross-process call, so it runs on **one background
+  daemon thread** (`_probe_obstacles`), **every 5s** (`PROBE_SECONDS`): apps open and close,
+  and the Widgets button changes width. Never on the tk loop: a slow walk can't stall the
+  overlay (and, since we're unparented, can't hang explorer). Always the same thread,
+  because the UIA COM objects belong to the thread that created them. The result is cached
+  for `reposition` to read; UIA failure degrades to a tray-only anchor. `comtypes` generates a
   typelib wrapper at first use; when frozen, `_uia_setup` redirects `gen_dir` to
   `%APPDATA%\ClaudeUsage\comtypes_gen` (site-packages is read-only in a `--onefile` exe).
 - Startup-at-login is an HKCU `...\Run` entry (`set_startup`/`is_startup_enabled`), which
@@ -215,3 +238,5 @@ the display choice applies live (`reposition` reads it each tick).
   minute: the API adds per-request microseconds, so the raw value changes on every poll.
 - Lazy imports inside methods (`PIL`, `tkinter`, `pystray`, `winreg`, `ctypes`) keep the
   pure-function layer importable without a display or Windows.
+- Tray menu text goes straight into a Win32 menu, which eats a lone `&` as a shortcut-key
+  marker: write "and" (or `&&`).

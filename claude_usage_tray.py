@@ -33,9 +33,10 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
-CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code public client
-CRED_PATH = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
+# Claude Code keeps its login here (CLAUDE_CONFIG_DIR moves the whole folder).
+CRED_PATH = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR")
+                         or os.path.join(os.path.expanduser("~"), ".claude"),
+                         ".credentials.json")
 USAGE_PAGE = "https://claude.ai/settings/usage"
 USER_AGENT = "claude-code/2.0.31"  # the usage endpoint expects the Claude Code UA
 
@@ -143,16 +144,19 @@ def fmt_clock(dt) -> str:
     return s
 
 
-def build_tooltip(usage: dict, stale: bool, retry_at=None) -> str:
+def build_tooltip(usage: dict, stale: bool, retry_at=None,
+                  signed_out: bool = False) -> str:
     """Detail line for tray tooltip / taskbar hover (tray caps at ~127 chars).
 
-    `retry_at` (a datetime) means we're rate-limited; surface when usage will
-    be readable again instead of a mute "no data".
+    `retry_at` (a datetime) means we're rate-limited; `signed_out` means the
+    token is missing/expired. Either way, say why instead of a mute "stale".
     """
-    rl = f"Rate-limited, retry {fmt_clock(retry_at)}" if retry_at else None
+    note = (f"Rate-limited, retry {fmt_clock(retry_at)}" if retry_at
+            else "Signed out: open Claude Code to sign in" if signed_out
+            else None)
     if not usage:
-        if rl:
-            return rl
+        if note:
+            return note
         return "Claude usage: no data" + (" (stale)" if stale else "")
     parts = []
     fh = usage.get("five_hour")
@@ -166,8 +170,8 @@ def build_tooltip(usage: dict, stale: bool, retry_at=None) -> str:
         if w and w["utilization"] > 0:
             parts.append(f"{label} {w['utilization']:.0f}%")
     tip = " | ".join(parts)
-    if rl:
-        tip += " | " + rl
+    if note:
+        tip += " | " + note
     elif stale:
         tip += " (STALE)"
     return tip[:127]
@@ -206,7 +210,7 @@ def pick_color(pct, stale: bool, palette):
 # ----------------------------------------------------------------------------
 # Outcome of one usage fetch. kind: "ok" | "auth" | "rate_limited" | "error"
 #   ok           -> .usage holds the parsed window dict
-#   auth         -> 401; caller may refresh the token and retry once
+#   auth         -> 401 or no usable token; Claude Code must renew it
 #   rate_limited -> 429; .retry_after holds the server's backoff seconds
 #   error        -> anything else (network, 5xx, bad body); keep last data
 FetchResult = namedtuple("FetchResult", "kind usage retry_after",
@@ -315,9 +319,7 @@ def select_release_assets(release_json, exe_name: str, sha_name: str):
         name = asset.get("name")
         if name in (exe_name, sha_name):
             urls[name] = asset.get("browser_download_url")
-    if exe_name not in urls or sha_name not in urls:
-        return None
-    if not urls[exe_name] or not urls[sha_name]:
+    if not (urls.get(exe_name) and urls.get(sha_name)):
         return None
     return UpdateInfo(tag, urls[exe_name], urls[sha_name])
 
@@ -468,7 +470,7 @@ def set_startup(enabled: bool) -> None:
 
 
 # ----------------------------------------------------------------------------
-# Credentials + refresh
+# Credentials (read-only: Claude Code owns them)
 # ----------------------------------------------------------------------------
 def read_credentials():
     try:
@@ -478,101 +480,46 @@ def read_credentials():
         return None
 
 
-def write_credentials(creds: dict) -> None:
-    """Atomic write so a crash mid-write can't corrupt Claude Code's auth."""
-    tmp = CRED_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(creds, f, indent=2)
-    os.replace(tmp, CRED_PATH)
-
-
-def refresh_token():
-    """OAuth refresh; writes new tokens back to the credentials file.
-
-    Returns a fresh access token, or None. Only called after a 401 so we
-    don't race Claude Code's own proactive refresh more than necessary.
-    """
-    creds = read_credentials()
-    oauth = (creds or {}).get("claudeAiOauth") or {}
-    rt = oauth.get("refreshToken")
-    if not rt:
-        return None
-    try:
-        r = requests.post(
-            TOKEN_URL,
-            json={"grant_type": "refresh_token", "refresh_token": rt,
-                  "client_id": CLIENT_ID},
-            headers={"User-Agent": USER_AGENT},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            return None
-        tok = r.json()
-    except (requests.RequestException, ValueError):
-        return None
-
-    access = tok.get("access_token")
-    if not access:
-        return None
-    oauth["accessToken"] = access
-    if tok.get("refresh_token"):
-        oauth["refreshToken"] = tok["refresh_token"]
-    if tok.get("expires_in"):
-        oauth["expiresAt"] = int(time.time() * 1000) + int(tok["expires_in"]) * 1000
-    # Re-read: Claude Code may have saved other entries (e.g. MCP logins) while
-    # we waited on the network. Replace only our key.
-    creds = read_credentials() or creds
-    creds["claudeAiOauth"] = oauth
-    try:
-        write_credentials(creds)
-    except OSError:
-        pass  # still return the in-memory token; worst case we refresh again
-    return access
-
-
 def fetch_usage(log=None) -> FetchResult:
-    """GET usage as a FetchResult; one 401-triggered refresh retry.
+    """GET usage as a FetchResult.
 
-    A 429 returns kind "rate_limited" with the server's Retry-After so the
-    caller can back off; everything else that isn't a clean 200 is "error"
-    (keep last-known numbers, gray them out). `log` is an optional callable
-    (str)->None used to surface the raw HTTP status / network errors so a
-    persistent "stale" state can be diagnosed via --debug.
+    We never renew the token. Claude Code refreshes it under its own lock
+    (~/.claude/.oauth_refresh.lock) and wipes the saved login when a refresh
+    token comes back rejected, so a second refresher that wins a race can sign
+    the user out. A missing or expired token is "auth" without a request; the
+    next poll picks up whatever Claude Code renewed. A 429 returns
+    "rate_limited" with the server's Retry-After; anything else that isn't a
+    clean 200 is "error" (keep last-known numbers, gray them out). `log` is an
+    optional callable (str)->None for --debug diagnostics.
     """
     def _emit(msg):
         if log:
             log(msg)
-    creds = read_credentials()
-    token = ((creds or {}).get("claudeAiOauth") or {}).get("accessToken")
+    oauth = (read_credentials() or {}).get("claudeAiOauth") or {}
+    token = oauth.get("accessToken")
     if not token:
         _emit("no access token in credentials -> auth")
         return FetchResult("auth")
-    for attempt in (1, 2):
-        try:
-            r = requests.get(
-                USAGE_URL,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "anthropic-beta": "oauth-2025-04-20",
-                    "User-Agent": USER_AGENT,
-                    "Accept": "application/json",
-                },
-                timeout=15,
-            )
-        except requests.RequestException as e:
-            _emit(f"GET usage raised {e!r} (attempt {attempt}) -> error")
-            return FetchResult("error")
-        _emit(f"GET usage -> HTTP {r.status_code} (attempt {attempt})")
-        res = classify_usage_response(r.status_code, r.headers, r.json)
-        if res.kind == "auth" and attempt == 1:
-            _emit("401 -> refreshing token")
-            token = refresh_token()
-            if not token:
-                _emit("token refresh failed -> auth")
-                return FetchResult("auth")
-            continue
-        return res
-    return FetchResult("error")
+    expires = oauth.get("expiresAt")   # epoch ms
+    if isinstance(expires, (int, float)) and expires <= time.time() * 1000:
+        _emit("access token expired; waiting for Claude Code to renew -> auth")
+        return FetchResult("auth")
+    try:
+        r = requests.get(
+            USAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-beta": "oauth-2025-04-20",
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            },
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        _emit(f"GET usage raised {e!r} -> error")
+        return FetchResult("error")
+    _emit(f"GET usage -> HTTP {r.status_code}")
+    return classify_usage_response(r.status_code, r.headers, r.json)
 
 
 # ----------------------------------------------------------------------------
@@ -686,25 +633,26 @@ def _uia_setup():
 
 
 def detect_taskbar_obstacles(taskbar_hwnd, taskbar_left, taskbar_width):
-    """Absolute (screen) left edges of right-docked taskbar furniture the badge
-    must clear — chiefly the Windows 11 Widgets/weather button, which lives in a
-    XAML composition island with no HWND, so only UI Automation can see it.
+    """What the badge must stay clear of on the taskbar, in screen coords:
+    (lefts, apps_right).
 
-    Returns [] when UIA is unavailable (caller falls back to anchoring on the
-    tray alone). Targets right-docked ToggleButtons (the Widgets button) and
-    ignores the left-clustered app icons / Start / Task View.
+    `lefts` are the left edges of right-docked furniture — chiefly the Windows
+    11 Widgets/weather button (a right-docked ToggleButton). `apps_right` is
+    the right edge of the last app button, or None. Both live in XAML islands
+    with no HWND, so only UI Automation can see them. ([], None) when UIA is
+    unavailable (caller falls back to anchoring on the tray alone).
 
-    NOTE: this is the one heavy, cross-process call; it must only run on a
-    background thread (never the tk UI thread), so a slow UIA walk can't stall
-    the overlay's message loop. The overlay is not parented into explorer, so a
-    stall here can't hang explorer either.
+    NOTE: this is the one heavy, cross-process call (~20 ms); it must only run
+    on a background thread (never the tk UI thread), so a slow UIA walk can't
+    stall the overlay's message loop. The overlay is not parented into
+    explorer, so a stall here can't hang explorer either.
     """
     setup = _uia_setup()
     if not setup:
-        return []
+        return [], None
     auto, walker = setup
     midpoint_abs = taskbar_left + taskbar_width // 2
-    lefts = []
+    lefts, app_rights = [], []
     try:
         root = auto.ElementFromHandle(taskbar_hwnd)
 
@@ -716,9 +664,11 @@ def detect_taskbar_obstacles(taskbar_hwnd, taskbar_left, taskbar_width):
                 try:
                     cls = child.CurrentClassName or ""
                     r = child.CurrentBoundingRectangle
-                    if (cls == "ToggleButton" and r.left > midpoint_abs
-                            and (r.right - r.left) > 0):
-                        lefts.append(r.left)        # absolute / screen coords
+                    if (r.right - r.left) > 0:
+                        if cls == "ToggleButton" and r.left > midpoint_abs:
+                            lefts.append(r.left)
+                        elif cls == "Taskbar.TaskListButtonAutomationPeer":
+                            app_rights.append(r.right)
                 except Exception:
                     pass
                 walk(child, depth + 1)
@@ -726,8 +676,8 @@ def detect_taskbar_obstacles(taskbar_hwnd, taskbar_left, taskbar_width):
 
         walk(root, 0)
     except Exception:
-        return []
-    return lefts
+        return [], None
+    return lefts, max(app_rights, default=None)
 
 
 @functools.cache
@@ -834,16 +784,20 @@ def enumerate_taskbar_displays():
         return []
 
 
-def compute_badge_x(obstacle_lefts, badge_w: int, margin: int, floor: int) -> int:
-    """X for the badge so it sits clear of every right-docked obstacle.
+def compute_badge_x(obstacle_lefts, badge_w: int, margin: int, floor: int):
+    """X for the badge so it sits clear of every right-docked obstacle, or
+    None when it doesn't fit.
 
     `obstacle_lefts` are the screen-coordinate left edges of things the badge
     must not cover — the tray area, and on Windows 11 the right-docked
     Widgets/weather button. The badge anchors to the leftmost of them so it
-    clears them all, clamped to `floor`: the docked taskbar's own left edge,
-    which is negative on a monitor placed left of the primary.
+    clears them all. `floor` is the leftmost x it may take: the end of the app
+    buttons, else the docked taskbar's own left edge (negative on a monitor
+    placed left of the primary). Below the floor it would cover app buttons,
+    so the caller hides it (the tray icon still shows the session %).
     """
-    return max(min(obstacle_lefts) - badge_w - margin, floor)
+    x = min(obstacle_lefts) - badge_w - margin
+    return x if x >= floor else None
 
 
 def is_fullscreen(win_rect, monitor_rect, win_class: str = "") -> bool:
@@ -907,8 +861,9 @@ class TaskbarBadge:
     SWP_NOMOVE = 0x2
     SWP_NOACTIVATE = 0x10
     MONITOR_DEFAULTTONEAREST = 0x2
-    MARGIN_RIGHT = 10  # px gap between badge and tray area
+    MARGIN_RIGHT = 10  # px gap between badge and tray area / app buttons
     TOPMOST_MS = 120   # re-assert topmost this often so taskbar clicks can't bury us
+    PROBE_SECONDS = 5  # re-read app buttons / Widgets; they move as apps open and close
 
     def __init__(self, app, debug=False):
         import ctypes
@@ -920,9 +875,10 @@ class TaskbarBadge:
         self.tk = tk
         self.tooltip = None
         self._tick_count = 0
-        self._obstacle_lefts = []   # absolute lefts from the background UIA probe
+        self._probe = ([], None)    # (obstacle lefts, apps_right) from the UIA probe
         self._last_geom = None      # (x,y,w,h) of the last MoveWindow; change-gate
-        self._hidden = False        # withdrawn because a fullscreen app is foreground
+        self._hidden = False        # withdrawn (fullscreen app, or no room)
+        self._no_room = False       # badge would cover app buttons
         self._dock_hwnd = 0         # taskbar HWND we're docked to (which monitor)
 
         # DPI awareness before any window is created, so coords line up
@@ -947,7 +903,7 @@ class TaskbarBadge:
         # Real top-level HWND is the wrapper around tk's client window
         self.hwnd = self.u32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
         self._apply_overlay_styles()
-        # Probe the Win11 right-docked Widgets button off the UI thread so a slow
+        # Probe the app buttons / Widgets button off the UI thread so a slow
         # UIA walk can never stall the overlay loop (or explorer).
         threading.Thread(target=self._probe_obstacles, daemon=True).start()
         self.reposition()
@@ -967,17 +923,23 @@ class TaskbarBadge:
                                             self.LWA_COLORKEY)
 
     def _probe_obstacles(self):
-        """One-shot background UIA scan for the right-docked Widgets button;
-        result is read by reposition() on the UI thread. Best-effort."""
-        try:
-            tb = self.u32.FindWindowW("Shell_TrayWnd", None)
-            r = self._rect(tb) if tb else None
-            if r:
-                self._obstacle_lefts = detect_taskbar_obstacles(
-                    tb, r.left, r.right - r.left)
-                self.log(f"obstacles (abs): {self._obstacle_lefts}")
-        except Exception as e:
-            self.log(f"obstacle probe failed: {e}")
+        """Background UIA scan of the primary taskbar, repeated every
+        PROBE_SECONDS (app buttons come and go; the Widgets button changes
+        width). Always this one thread: the UIA COM objects belong to the
+        thread that created them. reposition() reads the result. Best-effort."""
+        while True:
+            try:
+                tb = self.u32.FindWindowW("Shell_TrayWnd", None)
+                r = self._rect(tb) if tb else None
+                if r:
+                    probe = detect_taskbar_obstacles(tb, r.left, r.right - r.left)
+                    if probe != self._probe:
+                        self.log(f"obstacles (abs), apps_right: {probe}")
+                    self._probe = probe
+            except Exception as e:
+                self.log(f"obstacle probe failed: {e}")
+            if self.app.stop.wait(self.PROBE_SECONDS):
+                return
 
     # -- win32 plumbing -------------------------------------------------------
     def _rect(self, hwnd):
@@ -1015,24 +977,32 @@ class TaskbarBadge:
         tr = self._rect(tray) if tray else None
         tray_left = tr.left if tr else (tb.right - 250)
 
-        # The cached Widgets-button obstacles are primary-taskbar, primary-
-        # monitor coords; only fold them in when docked to the primary, else
-        # compute_badge_x's min() would drag the badge back to the primary.
-        obstacles = self._obstacle_lefts if (chosen and chosen["is_primary"]) else []
+        # The probe reads the primary taskbar, in primary-monitor coords; only
+        # use it when docked to the primary, else compute_badge_x's min() would
+        # drag the badge back to the primary.
+        # shortcut: no app-button floor on secondary taskbars; probe those too
+        # if a crowded secondary taskbar ever gets covered.
+        obstacles, apps_right = (self._probe if (chosen and chosen["is_primary"])
+                                 else ([], None))
+        floor = tb.left if apps_right is None else apps_right + self.MARGIN_RIGHT
 
         self.root.update_idletasks()
         w = self.label.winfo_reqwidth()
         h = self.label.winfo_reqheight()
-        x = compute_badge_x([tray_left] + obstacles, w, self.MARGIN_RIGHT,
-                            floor=tb.left)
+        x = compute_badge_x([tray_left] + obstacles, w, self.MARGIN_RIGHT, floor)
         y = tb.top + max((tb_h - h) // 2, 0)
 
+        if self._no_room != (x is None):
+            self.log(f"no room left of the tray (apps end at {apps_right}) -> "
+                     f"{'hide' if x is None else 'show'}")
+        self._no_room = x is None
         geom = (x, y, w, h)
-        if geom != self._last_geom:
+        if x is not None and geom != self._last_geom:
             self.u32.MoveWindow(self.hwnd, x, y, w, h, True)
             self._last_geom = geom
             self.log(f"moved to ({x},{y}) {w}x{h}; tray_left={tray_left}, "
-                     f"obstacles={obstacles}, dock={tb_hwnd}")
+                     f"obstacles={obstacles}, apps_right={apps_right}, "
+                     f"dock={tb_hwnd}")
         self._assert_topmost()
 
     def _fullscreen_on_badge_monitor(self) -> bool:
@@ -1075,11 +1045,11 @@ class TaskbarBadge:
     def _assert_topmost(self):
         """Pop the overlay back above the (topmost) taskbar — clicking the
         taskbar otherwise raises it over us. Skipped (and the overlay hidden)
-        while a fullscreen app is foreground *on the badge's own monitor*,
-        mirroring the taskbar's auto-hide; a fullscreen app on another display
-        leaves us visible. A Z-only, non-activating change: cheap, no repaint,
-        doesn't eat clicks."""
-        if self._fullscreen_on_badge_monitor():
+        while there's no room beside the app buttons, or a fullscreen app is
+        foreground *on the badge's own monitor*, mirroring the taskbar's
+        auto-hide; a fullscreen app on another display leaves us visible. A
+        Z-only, non-activating change: cheap, no repaint, doesn't eat clicks."""
+        if self._no_room or self._fullscreen_on_badge_monitor():
             if not self._hidden:
                 self.root.withdraw()
                 self._hidden = True
@@ -1114,8 +1084,7 @@ class TaskbarBadge:
         tip.overrideredirect(True)
         tip.attributes("-topmost", True)
         lbl = self.tk.Label(tip,
-                            text=build_tooltip(self.app.usage, self.app.stale,
-                                               self.app.retry_at()),
+                            text=self.app.tooltip_text(),
                             bg="#1f2428", fg="#e6edf3",
                             font=("Segoe UI", 9), padx=8, pady=4)
         lbl.pack()
@@ -1322,8 +1291,12 @@ class UsageTray:
             self._move_retry(old, canonical, replace=False)   # rollback
             return self._update_failed("could not install new exe", None)
 
-        # 3. Relaunch the new exe, then quit to release the mutex.
-        self._relaunch(canonical, install_dir)
+        # 3. Relaunch the new exe, then quit to release the mutex. If it won't
+        # start (e.g. antivirus blocks the fresh unsigned exe), put this build
+        # back and keep running rather than quit into nothing.
+        if not self._relaunch(canonical, install_dir):
+            self._move_retry(old, canonical, replace=True)
+            return self._update_failed("the new version would not start", None)
         self.quit()
 
     def _fetch_sidecar_hash(self, url):
@@ -1347,7 +1320,8 @@ class UsageTray:
                 time.sleep(delay)
         return False
 
-    def _relaunch(self, exe, cwd):
+    def _relaunch(self, exe, cwd) -> bool:
+        """Start the new exe as an independent process. True if it started."""
         import subprocess
         DETACHED_PROCESS = 0x00000008
         CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -1360,10 +1334,15 @@ class UsageTray:
                 close_fds=True, cwd=cwd,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                # Without this the new --onefile exe inherits our _PYI_* vars,
+                # runs out of OUR unpack dir (old DLLs), and our launcher can't
+                # delete that dir: it hangs on a "Failed to remove temporary
+                # directory" dialog.
+                env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"},
             )
+            return True
         except OSError:
-            # Swap already succeeded; the new exe runs at next login regardless.
-            pass
+            return False
 
     def _update_failed(self, reason, cleanup_path):
         if cleanup_path:
@@ -1404,13 +1383,17 @@ class UsageTray:
             return datetime.fromtimestamp(self.rate_limited_until).astimezone()
         return None
 
+    def tooltip_text(self):
+        return build_tooltip(self.usage, self.stale, self.retry_at(),
+                             signed_out=self.last_result.kind == "auth")
+
     def update_icon(self):
         if not self.icon:
             return
         fh = self.usage.get("five_hour")
         pct = fh["utilization"] if fh else None
         self.icon.icon = render_icon(pct, self.stale)
-        self.icon.title = build_tooltip(self.usage, self.stale, self.retry_at())
+        self.icon.title = self.tooltip_text()
 
     def toggle_startup(self):
         set_startup(not is_startup_enabled())
@@ -1444,10 +1427,11 @@ class UsageTray:
         if frozen:
             # Visible only once a newer release is staged; text/visibility are
             # callables so update_menu() reflects state without rebuilding.
+            # ("and", not "&": Win32 menus eat a lone & as a shortcut marker.)
             items.append(Item(
-                lambda item: (f"Update to {self._pending.tag} & restart"
-                              if self._pending else "Update & restart"),
-                lambda: self.start_update(),
+                lambda item: (f"Update to {self._pending.tag} and restart"
+                              if self._pending else "Update and restart"),
+                self.start_update,
                 visible=lambda item: self._pending is not None))
         items += [
             Menu.SEPARATOR,
@@ -1553,8 +1537,6 @@ def main():
                          "outgoing instance to release the single-instance lock")
     args = ap.parse_args()
 
-    cleanup_update_leftovers()
-
     # Only one instance may poll; a second would double the request rate into
     # the rate-limited usage endpoint. Hold the handle for the process life.
     # An update relaunch waits out the outgoing instance's lock; a normal
@@ -1565,6 +1547,11 @@ def main():
     if _instance_handle is None:
         _warn("ClaudeUsage is already running.\n")
         sys.exit(0)
+
+    # Only the instance that owns the mutex cleans up, so a duplicate launch
+    # can't delete a running update's download. Delayed: the outgoing
+    # instance's launcher still holds .old.exe for a moment after the mutex.
+    threading.Timer(5, cleanup_update_leftovers).start()
 
     config = load_config()
     if args.taskbar:
