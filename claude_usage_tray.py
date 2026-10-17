@@ -25,7 +25,7 @@ import requests
 # /api/oauth/usage is an on-demand endpoint (Claude Code only hits it when you
 # run /usage). The 5h/7d windows move slowly, so polling every 5 min is plenty
 # and — crucially — avoids tripping the endpoint's rate limit. See fetch_usage.
-VERSION = "1.0.9"  # single source of truth; release.ps1/CI tag releases from this
+VERSION = "1.0.10"  # single source of truth; release.ps1/CI tag releases from this
 POLL_SECONDS = 300
 MIN_FETCH_GAP = 60   # a click/Refresh never fetches sooner than this after the last fetch
 SIGNIN_RECHECK = 30  # signed out: re-read the token file this often (no request is made)
